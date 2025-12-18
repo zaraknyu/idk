@@ -203,20 +203,19 @@ class SystemUiProxy @Inject constructor(@ApplicationContext private val context:
         }
     }
 
-    fun onBackEvent(backEvent: KeyEvent?, displayId: Int) =
+    fun onBackEvent(backEvent: KeyEvent?) =
         executeWithErrorLog({ "Failed call onBackPressed" }) {
-            systemUiProxy?.onBackEvent(backEvent, displayId)
-        }
-
-    /** SystemUI will run ACTION_DOWN and ACTION_UP KeyEvents for the given keycode. */
-    fun onKeyEvent(keycode: Int, displayId: Int) =
-        executeWithErrorLog({ "Failed call onKeyEvent ${KeyEvent.keyCodeToString(keycode)}" }) {
-            systemUiProxy?.onKeyEvent(keycode, displayId)
+            systemUiProxy?.onBackEvent(backEvent)
         }
 
     fun injectLongPress(keyCode: Int) =
         executeWithErrorLog({ "Failed call injectLongPress" }) {
             systemUiProxy?.injectLongPress(keyCode)
+        }
+
+    fun injectPress(keyCode: Int) =
+        executeWithErrorLog({ "Failed call injectPress" }) {
+            systemUiProxy?.injectPress(keyCode)
         }
 
     fun onImeSwitcherPressed() =
