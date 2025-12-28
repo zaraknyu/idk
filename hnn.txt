@@ -36,7 +36,15 @@ def lib_fixup_vendor_suffix(lib: str, partition: str, *args, **kwargs):
 lib_fixups: lib_fixups_user_type = {
     **lib_fixups,
     (
-    ): lib_fixup_odm_suffix,
+        'libagm',
+        'libagmclient',
+        'libagmmixer',
+        'libar-acdb',
+        'libar-gsl',
+        'libats',
+        'liblx-osal',
+        'libvui_intf',
+    ): lib_fixup_remove,
     (
         'vendor.qti.diaghal@1.0',
         'vendor.qti.hardware.qccsyshal@1.0',
@@ -138,15 +146,18 @@ blob_fixups: blob_fixups_user_type = {
             'android.hardware.graphics.allocator-V2-ndk.so'
     ),
     (
+        'vendor/lib64/libmialgoengine.so',
         'system_ext/lib64/libcameraopt.so',
     ): blob_fixup()
         .add_needed('libprocessgroup_shim.so'),
     (
+        'vendor/lib64/libanc_single_rt_bokeh.so',
         'vendor/lib64/libTrueSight.so',
         'vendor/lib64/libMiVideoFilter.so',
     ): blob_fixup()
         .clear_symbol_version('AHardwareBuffer_allocate')
         .clear_symbol_version('AHardwareBuffer_describe')
+        .clear_symbol_version('AHardwareBuffer_isSupported')
         .clear_symbol_version('AHardwareBuffer_lock')
         .clear_symbol_version('AHardwareBuffer_lockPlanes')
         .clear_symbol_version('AHardwareBuffer_release')
