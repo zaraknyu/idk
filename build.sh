@@ -2,7 +2,7 @@
 
 # Repo Init
 repo init -u https://github.com/LineageOS/android.git -b lineage-23.0 --git-lfs
-/opt/crave/resync.sh
+repo sync -c -j$(nproc --all) --force-sync --no-tags --no-clone-bundle --prune
 
 # Removing used directories
 rm -rf device/xiaomi/warm
@@ -23,4 +23,11 @@ lunch lineage_warm-bp2a-userdebug
 mka bacon -j$(nproc --all)
 
 # Upload file to TMP GOFILE
+echo "THIS IS NOW UPLOADING TO GOFILE IF BALWINDAR IS SLEEPING AF LMAOOOOOOOOOOOOOOOOOO"
+echo "STILL IN PROGESS"
+
+
 curl -F "file=@out/target/product/warm/lineage-23.0*UNOFFICIAL*.zip" https://store2.gofile.io/uploadFile
+
+
+echo "DONE UPLOADING TO GOFILE, BALWINDAR,thoda kashth krke link bhej dijiye, lazy boi"
