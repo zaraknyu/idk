@@ -7,6 +7,7 @@ audio.deep_buffer.media=true
 audio.offload.video=true
 debug.c2.use_dmabufheaps=1
 ro.audio.flinger_standbytime_ms=2000
+ro.audio.monitorRotation=false
 vendor.audio.adm.buffering.ms=2
 vendor.audio.compress_capture.aac.cut_off_freq=-1
 vendor.audio.compress_capture.aac=true
