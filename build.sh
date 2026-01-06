@@ -20,7 +20,7 @@ git clone https://github.com/LineageOS/android_hardware_xiaomi -b lineage-23.0 h
 # Building
 source build/envsetup.sh
 lunch lineage_warm-bp2a-eng
-mka bacon -j$(nproc --all)
+mka bacon
 
 # Upload to GAYFILE lol
 curl -F "file=@out/target/product/warm/lineage-23.0*UNOFFICIAL*.zip" https://store2.gofile.io/uploadFile
