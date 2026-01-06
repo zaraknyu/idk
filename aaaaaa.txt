@@ -6,7 +6,9 @@ aaudio.mmap_policy=2
 audio.deep_buffer.media=true
 audio.offload.video=true
 debug.c2.use_dmabufheaps=1
+persist.vendor.audio.induce_crash=false
 ro.audio.flinger_standbytime_ms=2000
+ro.audio.monitorRotation=false
 vendor.audio.adm.buffering.ms=2
 vendor.audio.compress_capture.aac.cut_off_freq=-1
 vendor.audio.compress_capture.aac=true
@@ -29,7 +31,6 @@ vendor.audio_hal.in_period_size=144
 vendor.audio_hal.period_size=192
 vendor.qc2audio.per_frame.flac.dec.enabled=true
 vendor.qc2audio.suspend.enabled=true
-vendor.audio.compress_capture.aac.cut_off_freq=-1
 vendor.audio.cpu.sched.cpus=8
 vendor.audio.cpu.sched.cpuset.af=248
 vendor.audio.cpu.sched.cpuset.at=248
@@ -81,6 +82,9 @@ persist.vendor.dpm.vndr.halservice.enable=1
 # DRM
 drm.service.enabled=true
 
+# FW Detect
+ro.vendor.qti.va_odm.support=1
+
 # FRP
 ro.frp.pst=/dev/block/bootdevice/by-name/frp
 
@@ -113,26 +117,24 @@ persist.sys.sf.color_saturation=1.0
 ro.hardware.egl=adreno
 ro.hardware.vulkan=adreno
 ro.opengles.version=196610
-ro.surface_flinger.has_wide_color_display=false
-ro.surface_flinger.has_HDR_display=false
-ro.surface_flinger.use_color_management=true
-ro.surface_flinger.wcg_composition_dataspace=143261696
-ro.surface_flinger.protected_contents=true
-ro.surface_flinger.use_content_detection_for_refresh_rate=true
-ro.surface_flinger.set_touch_timer_ms=200
+ro.surface_flinger.clear_slots_with_set_layer_buffer=false
 ro.surface_flinger.force_hwc_copy_for_virtual_displays=true
+ro.surface_flinger.has_HDR_display=false
+ro.surface_flinger.has_wide_color_display=false
 ro.surface_flinger.max_frame_buffer_acquired_buffers=3
 ro.surface_flinger.max_virtual_display_dimension=4096
-ro.surface_flinger.clear_slots_with_set_layer_buffer=false
+ro.surface_flinger.protected_contents=true
+ro.surface_flinger.set_touch_timer_ms=200
 ro.surface_flinger.supports_background_blur=0
-
-# Display Feature
+ro.surface_flinger.use_color_management=true
+ro.surface_flinger.use_content_detection_for_refresh_rate=true
+ro.surface_flinger.wcg_composition_dataspace=143261696
 ro.vendor.displayfeature.dump=true
 vendor.display.comp_mask=2
 vendor.display.disable_excl_rect=0
 vendor.display.disable_excl_rect_partial_fb=1
-vendor.display.disable_hw_recovery_dump=1
 vendor.display.disable_get_screen_decorator_support=1
+vendor.display.disable_hw_recovery_dump=1
 vendor.display.disable_offline_rotator=1
 vendor.display.disable_scaler=0
 vendor.display.disable_sdr_dimming=0
@@ -152,7 +154,6 @@ ro.vendor.sre.enable=false
 sys.displayfeature.entry.enable=true
 vendor.display.disable_3d_adaptive_tm=1
 vendor.display.disable_cwb_idle_fallback=1
-vendor.display.disable_sdr_dimming=0
 vendor.display.disable_stc_dimming=1
 vendor.display.force_tonemapping=1
 vendor.display.idle_time=0
@@ -187,7 +188,6 @@ ro.soc.model=SM4635
 persist.vendor.qcomsysd.enabled=1
 
 # Radio
-ro.telephony.default_network=33,33
 keyguard.no_require_sim=true
 persist.radio.multisim.config=dsds
 persist.vendor.radio.apm_sim_not_pwdn=1
@@ -199,11 +199,15 @@ persist.vendor.rcs.singlereg.feature=0
 ro.com.android.dataroaming=true
 ro.vendor.radio.build_profile=miui
 ro.vendor.radio.build_region=global
+ro.telephony.default_network=33,33
 
 # Sensors
 ro.vendor.sensors.xiaomi.double_tap=true
 ro.vendor.sensors.xiaomi.single_tap=true
-ro.vendor.sensors.xiaomi.udfps=false
+ro.vendor.sensors.xiaomi.dfps=true
+
+# SSR
+persist.vendor.ssr.restart_level=ALL_ENABLE
 
 # SKU
 ro.boot.product.vendor.sku=pitti
