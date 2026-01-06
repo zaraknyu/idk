@@ -1,2176 +1,1291 @@
-/*
- * Compressed RAM block device
- *
- * Copyright (C) 2008, 2009, 2010  Nitin Gupta
- *               2012, 2013 Minchan Kim
- *
- * This code is released using a dual license strategy: BSD/GPL
- * You can choose the licence that better fits your requirements.
- *
- * Released under the terms of 3-clause BSD License
- * Released under the terms of GNU General Public License Version 2.0
- *
- */
-
-#define KMSG_COMPONENT "zram"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
-
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/bio.h>
-#include <linux/bitops.h>
-#include <linux/blkdev.h>
-#include <linux/buffer_head.h>
-#include <linux/device.h>
-#include <linux/highmem.h>
-#include <linux/slab.h>
-#include <linux/backing-dev.h>
-#include <linux/string.h>
-#include <linux/vmalloc.h>
-#include <linux/err.h>
-#include <linux/idr.h>
-#include <linux/sysfs.h>
-#include <linux/debugfs.h>
-#include <linux/cpuhotplug.h>
-#include <linux/part_stat.h>
-
-#include "zram_drv.h"
-
-static DEFINE_IDR(zram_index_idr);
-/* idr index must be protected */
-static DEFINE_MUTEX(zram_index_mutex);
-
-static int zram_major;
-static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;
-
-/* Module params (documentation at end) */
-static unsigned int num_devices = 1;
-/*
- * Pages that compress to sizes equals or greater than this are stored
- * uncompressed in memory.
- */
-static size_t huge_class_size;
-
-static const struct block_device_operations zram_devops;
-
-static void zram_free_page(struct zram *zram, size_t index);
-static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,
-				u32 index, int offset, struct bio *bio);
-
-
-static int zram_slot_trylock(struct zram *zram, u32 index)
-{
-	return bit_spin_trylock(ZRAM_LOCK, &zram->table[index].flags);
-}
-
-static void zram_slot_lock(struct zram *zram, u32 index)
-{
-	bit_spin_lock(ZRAM_LOCK, &zram->table[index].flags);
-}
-
-static void zram_slot_unlock(struct zram *zram, u32 index)
-{
-	bit_spin_unlock(ZRAM_LOCK, &zram->table[index].flags);
-}
-
-static inline bool init_done(struct zram *zram)
-{
-	return zram->disksize;
-}
-
-static inline struct zram *dev_to_zram(struct device *dev)
-{
-	return (struct zram *)dev_to_disk(dev)->private_data;
-}
-
-static unsigned long zram_get_handle(struct zram *zram, u32 index)
-{
-	return zram->table[index].handle;
-}
-
-static void zram_set_handle(struct zram *zram, u32 index, unsigned long handle)
-{
-	zram->table[index].handle = handle;
-}
-
-/* flag operations require table entry bit_spin_lock() being held */
-static bool zram_test_flag(struct zram *zram, u32 index,
-			enum zram_pageflags flag)
-{
-	return zram->table[index].flags & BIT(flag);
-}
-
-static void zram_set_flag(struct zram *zram, u32 index,
-			enum zram_pageflags flag)
-{
-	zram->table[index].flags |= BIT(flag);
-}
-
-static void zram_clear_flag(struct zram *zram, u32 index,
-			enum zram_pageflags flag)
-{
-	zram->table[index].flags &= ~BIT(flag);
-}
-
-static inline void zram_set_element(struct zram *zram, u32 index,
-			unsigned long element)
-{
-	zram->table[index].element = element;
-}
-
-static unsigned long zram_get_element(struct zram *zram, u32 index)
-{
-	return zram->table[index].element;
-}
-
-static size_t zram_get_obj_size(struct zram *zram, u32 index)
-{
-	return zram->table[index].flags & (BIT(ZRAM_FLAG_SHIFT) - 1);
-}
-
-static void zram_set_obj_size(struct zram *zram,
-					u32 index, size_t size)
-{
-	unsigned long flags = zram->table[index].flags >> ZRAM_FLAG_SHIFT;
-
-	zram->table[index].flags = (flags << ZRAM_FLAG_SHIFT) | size;
-}
-
-static inline bool zram_allocated(struct zram *zram, u32 index)
-{
-	return zram_get_obj_size(zram, index) ||
-			zram_test_flag(zram, index, ZRAM_SAME) ||
-			zram_test_flag(zram, index, ZRAM_WB);
-}
-
-#if PAGE_SIZE != 4096
-static inline bool is_partial_io(struct bio_vec *bvec)
-{
-	return bvec->bv_len != PAGE_SIZE;
-}
-#else
-static inline bool is_partial_io(struct bio_vec *bvec)
-{
-	return false;
-}
-#endif
-
-/*
- * Check if request is within bounds and aligned on zram logical blocks.
- */
-static inline bool valid_io_request(struct zram *zram,
-		sector_t start, unsigned int size)
-{
-	u64 end, bound;
-
-	/* unaligned request */
-	if (unlikely(start & (ZRAM_SECTOR_PER_LOGICAL_BLOCK - 1)))
-		return false;
-	if (unlikely(size & (ZRAM_LOGICAL_BLOCK_SIZE - 1)))
-		return false;
-
-	end = start + (size >> SECTOR_SHIFT);
-	bound = zram->disksize >> SECTOR_SHIFT;
-	/* out of range range */
-	if (unlikely(start >= bound || end > bound || start > end))
-		return false;
-
-	/* I/O request is valid */
-	return true;
-}
-
-static void update_position(u32 *index, int *offset, struct bio_vec *bvec)
-{
-	*index  += (*offset + bvec->bv_len) / PAGE_SIZE;
-	*offset = (*offset + bvec->bv_len) % PAGE_SIZE;
-}
-
-static inline void update_used_max(struct zram *zram,
-					const unsigned long pages)
-{
-	unsigned long old_max, cur_max;
-
-	old_max = atomic_long_read(&zram->stats.max_used_pages);
-
-	do {
-		cur_max = old_max;
-		if (pages > cur_max)
-			old_max = atomic_long_cmpxchg(
-				&zram->stats.max_used_pages, cur_max, pages);
-	} while (old_max != cur_max);
-}
-
-static inline void zram_fill_page(void *ptr, unsigned long len,
-					unsigned long value)
-{
-	WARN_ON_ONCE(!IS_ALIGNED(len, sizeof(unsigned long)));
-	memset_l(ptr, value, len / sizeof(unsigned long));
-}
-
-static bool page_same_filled(void *ptr, unsigned long *element)
-{
-	unsigned long *page;
-	unsigned long val;
-	unsigned int pos, last_pos = PAGE_SIZE / sizeof(*page) - 1;
-
-	page = (unsigned long *)ptr;
-	val = page[0];
-
-	if (val != page[last_pos])
-		return false;
-
-	for (pos = 1; pos < last_pos; pos++) {
-		if (val != page[pos])
-			return false;
-	}
-
-	*element = val;
-
-	return true;
-}
-
-static ssize_t initstate_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	u32 val;
-	struct zram *zram = dev_to_zram(dev);
-
-	down_read(&zram->init_lock);
-	val = init_done(zram);
-	up_read(&zram->init_lock);
-
-	return scnprintf(buf, PAGE_SIZE, "%u\n", val);
-}
-
-static ssize_t disksize_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct zram *zram = dev_to_zram(dev);
-
-	return scnprintf(buf, PAGE_SIZE, "%llu\n", zram->disksize);
-}
-
-static ssize_t mem_limit_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	u64 limit;
-	char *tmp;
-	struct zram *zram = dev_to_zram(dev);
-
-	limit = memparse(buf, &tmp);
-	if (buf == tmp) /* no chars parsed, invalid input */
-		return -EINVAL;
-
-	down_write(&zram->init_lock);
-	zram->limit_pages = PAGE_ALIGN(limit) >> PAGE_SHIFT;
-	up_write(&zram->init_lock);
-
-	return len;
-}
-
-static ssize_t mem_used_max_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	int err;
-	unsigned long val;
-	struct zram *zram = dev_to_zram(dev);
-
-	err = kstrtoul(buf, 10, &val);
-	if (err || val != 0)
-		return -EINVAL;
-
-	down_read(&zram->init_lock);
-	if (init_done(zram)) {
-		atomic_long_set(&zram->stats.max_used_pages,
-				zs_get_total_pages(zram->mem_pool));
-	}
-	up_read(&zram->init_lock);
-
-	return len;
-}
-
-/*
- * Mark all pages which are older than or equal to cutoff as IDLE.
- * Callers should hold the zram init lock in read mode
- */
-static void mark_idle(struct zram *zram, ktime_t cutoff)
-{
-	int is_idle = 1;
-	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
-	int index;
-
-	for (index = 0; index < nr_pages; index++) {
-		/*
-		 * Do not mark ZRAM_UNDER_WB slot as ZRAM_IDLE to close race.
-		 * See the comment in writeback_store.
-		 */
-		zram_slot_lock(zram, index);
-		if (zram_allocated(zram, index) &&
-				!zram_test_flag(zram, index, ZRAM_UNDER_WB)) {
-#ifdef CONFIG_ZRAM_MEMORY_TRACKING
-			is_idle = !cutoff || ktime_after(cutoff, zram->table[index].ac_time);
-#endif
-			if (is_idle)
-				zram_set_flag(zram, index, ZRAM_IDLE);
-		}
-		zram_slot_unlock(zram, index);
-	}
-}
-
-static ssize_t idle_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	struct zram *zram = dev_to_zram(dev);
-	ktime_t cutoff_time = 0;
-	ssize_t rv = -EINVAL;
-
-	if (!sysfs_streq(buf, "all")) {
-		/*
-		 * If it did not parse as 'all' try to treat it as an integer
-		 * when we have memory tracking enabled.
-		 */
-		u64 age_sec;
-
-		if (IS_ENABLED(CONFIG_ZRAM_MEMORY_TRACKING) && !kstrtoull(buf, 0, &age_sec))
-			cutoff_time = ktime_sub(ktime_get_boottime(),
-					ns_to_ktime(age_sec * NSEC_PER_SEC));
-		else
-			goto out;
-	}
-
-	down_read(&zram->init_lock);
-	if (!init_done(zram))
-		goto out_unlock;
-
-	/*
-	 * A cutoff_time of 0 marks everything as idle, this is the
-	 * "all" behavior.
-	 */
-	mark_idle(zram, cutoff_time);
-	rv = len;
-
-out_unlock:
-	up_read(&zram->init_lock);
-out:
-	return rv;
-}
-
-#ifdef CONFIG_ZRAM_WRITEBACK
-static ssize_t writeback_limit_enable_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	struct zram *zram = dev_to_zram(dev);
-	u64 val;
-	ssize_t ret = -EINVAL;
-
-	if (kstrtoull(buf, 10, &val))
-		return ret;
-
-	down_read(&zram->init_lock);
-	spin_lock(&zram->wb_limit_lock);
-	zram->wb_limit_enable = val;
-	spin_unlock(&zram->wb_limit_lock);
-	up_read(&zram->init_lock);
-	ret = len;
-
-	return ret;
-}
-
-static ssize_t writeback_limit_enable_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	bool val;
-	struct zram *zram = dev_to_zram(dev);
-
-	down_read(&zram->init_lock);
-	spin_lock(&zram->wb_limit_lock);
-	val = zram->wb_limit_enable;
-	spin_unlock(&zram->wb_limit_lock);
-	up_read(&zram->init_lock);
-
-	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
-}
-
-static ssize_t writeback_limit_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	struct zram *zram = dev_to_zram(dev);
-	u64 val;
-	ssize_t ret = -EINVAL;
-
-	if (kstrtoull(buf, 10, &val))
-		return ret;
-
-	down_read(&zram->init_lock);
-	spin_lock(&zram->wb_limit_lock);
-	zram->bd_wb_limit = val;
-	spin_unlock(&zram->wb_limit_lock);
-	up_read(&zram->init_lock);
-	ret = len;
-
-	return ret;
-}
-
-static ssize_t writeback_limit_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	u64 val;
-	struct zram *zram = dev_to_zram(dev);
-
-	down_read(&zram->init_lock);
-	spin_lock(&zram->wb_limit_lock);
-	val = zram->bd_wb_limit;
-	spin_unlock(&zram->wb_limit_lock);
-	up_read(&zram->init_lock);
-
-	return scnprintf(buf, PAGE_SIZE, "%llu\n", val);
-}
-
-static void reset_bdev(struct zram *zram)
-{
-	struct block_device *bdev;
-
-	if (!zram->backing_dev)
-		return;
-
-	bdev = zram->bdev;
-	blkdev_put(bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
-	/* hope filp_close flush all of IO */
-	filp_close(zram->backing_dev, NULL);
-	zram->backing_dev = NULL;
-	zram->bdev = NULL;
-	zram->disk->fops = &zram_devops;
-	kvfree(zram->bitmap);
-	zram->bitmap = NULL;
-}
-
-static ssize_t backing_dev_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct file *file;
-	struct zram *zram = dev_to_zram(dev);
-	char *p;
-	ssize_t ret;
-
-	down_read(&zram->init_lock);
-	file = zram->backing_dev;
-	if (!file) {
-		memcpy(buf, "none\n", 5);
-		up_read(&zram->init_lock);
-		return 5;
-	}
-
-	p = file_path(file, buf, PAGE_SIZE - 1);
-	if (IS_ERR(p)) {
-		ret = PTR_ERR(p);
-		goto out;
-	}
-
-	ret = strlen(p);
-	memmove(buf, p, ret);
-	buf[ret++] = '\n';
-out:
-	up_read(&zram->init_lock);
-	return ret;
-}
-
-static ssize_t backing_dev_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	char *file_name;
-	size_t sz;
-	struct file *backing_dev = NULL;
-	struct inode *inode;
-	struct address_space *mapping;
-	unsigned int bitmap_sz;
-	unsigned long nr_pages, *bitmap = NULL;
-	struct block_device *bdev = NULL;
-	int err;
-	struct zram *zram = dev_to_zram(dev);
-
-	file_name = kmalloc(PATH_MAX, GFP_KERNEL);
-	if (!file_name)
-		return -ENOMEM;
-
-	down_write(&zram->init_lock);
-	if (init_done(zram)) {
-		pr_info("Can't setup backing device for initialized device\n");
-		err = -EBUSY;
-		goto out;
-	}
-
-	strscpy(file_name, buf, PATH_MAX);
-	/* ignore trailing newline */
-	sz = strlen(file_name);
-	if (sz > 0 && file_name[sz - 1] == '\n')
-		file_name[sz - 1] = 0x00;
-
-	backing_dev = filp_open_block(file_name, O_RDWR|O_LARGEFILE, 0);
-	if (IS_ERR(backing_dev)) {
-		err = PTR_ERR(backing_dev);
-		backing_dev = NULL;
-		goto out;
-	}
-
-	mapping = backing_dev->f_mapping;
-	inode = mapping->host;
-
-	/* Support only block device in this moment */
-	if (!S_ISBLK(inode->i_mode)) {
-		err = -ENOTBLK;
-		goto out;
-	}
-
-	bdev = blkdev_get_by_dev(inode->i_rdev,
-			FMODE_READ | FMODE_WRITE | FMODE_EXCL, zram);
-	if (IS_ERR(bdev)) {
-		err = PTR_ERR(bdev);
-		bdev = NULL;
-		goto out;
-	}
-
-	nr_pages = i_size_read(inode) >> PAGE_SHIFT;
-	/* Refuse to use zero sized device (also prevents self reference) */
-	if (!nr_pages) {
-		err = -EINVAL;
-		goto out;
-	}
-
-	bitmap_sz = BITS_TO_LONGS(nr_pages) * sizeof(long);
-	bitmap = kvzalloc(bitmap_sz, GFP_KERNEL);
-	if (!bitmap) {
-		err = -ENOMEM;
-		goto out;
-	}
-
-	reset_bdev(zram);
-
-	zram->bdev = bdev;
-	zram->backing_dev = backing_dev;
-	zram->bitmap = bitmap;
-	zram->nr_pages = nr_pages;
-	up_write(&zram->init_lock);
-
-	pr_info("setup backing device %s\n", file_name);
-	kfree(file_name);
-
-	return len;
-out:
-	kvfree(bitmap);
-
-	if (bdev)
-		blkdev_put(bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
-
-	if (backing_dev)
-		filp_close(backing_dev, NULL);
-
-	up_write(&zram->init_lock);
-
-	kfree(file_name);
-
-	return err;
-}
-
-static unsigned long alloc_block_bdev(struct zram *zram)
-{
-	unsigned long blk_idx = 1;
-retry:
-	/* skip 0 bit to confuse zram.handle = 0 */
-	blk_idx = find_next_zero_bit(zram->bitmap, zram->nr_pages, blk_idx);
-	if (blk_idx == zram->nr_pages)
-		return 0;
-
-	if (test_and_set_bit(blk_idx, zram->bitmap))
-		goto retry;
-
-	atomic64_inc(&zram->stats.bd_count);
-	return blk_idx;
-}
-
-static void free_block_bdev(struct zram *zram, unsigned long blk_idx)
-{
-	int was_set;
-
-	was_set = test_and_clear_bit(blk_idx, zram->bitmap);
-	WARN_ON_ONCE(!was_set);
-	atomic64_dec(&zram->stats.bd_count);
-}
-
-static void zram_page_end_io(struct bio *bio)
-{
-	struct page *page = bio_first_page_all(bio);
-
-	page_endio(page, op_is_write(bio_op(bio)),
-			blk_status_to_errno(bio->bi_status));
-	bio_put(bio);
-}
-
-/*
- * Returns 1 if the submission is successful.
- */
-static int read_from_bdev_async(struct zram *zram, struct bio_vec *bvec,
-			unsigned long entry, struct bio *parent)
-{
-	struct bio *bio;
-
-	bio = bio_alloc(zram->bdev, 1, parent ? parent->bi_opf : REQ_OP_READ,
-			GFP_NOIO);
-	if (!bio)
-		return -ENOMEM;
-
-	bio->bi_iter.bi_sector = entry * (PAGE_SIZE >> 9);
-	if (!bio_add_page(bio, bvec->bv_page, bvec->bv_len, bvec->bv_offset)) {
-		bio_put(bio);
-		return -EIO;
-	}
-
-	if (!parent)
-		bio->bi_end_io = zram_page_end_io;
-	else
-		bio_chain(bio, parent);
-
-	submit_bio(bio);
-	return 1;
-}
-
-#define PAGE_WB_SIG "page_index="
-
-#define PAGE_WRITEBACK 0
-#define HUGE_WRITEBACK (1<<0)
-#define IDLE_WRITEBACK (1<<1)
-
-static ssize_t writeback_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	struct zram *zram = dev_to_zram(dev);
-	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
-	unsigned long index = 0;
-	struct bio bio;
-	struct bio_vec bio_vec;
-	struct page *page;
-	ssize_t ret = len;
-	int mode, err;
-	unsigned long blk_idx = 0;
-
-	if (sysfs_streq(buf, "idle"))
-		mode = IDLE_WRITEBACK;
-	else if (sysfs_streq(buf, "huge"))
-		mode = HUGE_WRITEBACK;
-	else if (sysfs_streq(buf, "huge_idle"))
-		mode = IDLE_WRITEBACK | HUGE_WRITEBACK;
-	else {
-		if (strncmp(buf, PAGE_WB_SIG, sizeof(PAGE_WB_SIG) - 1))
-			return -EINVAL;
-
-		if (kstrtol(buf + sizeof(PAGE_WB_SIG) - 1, 10, &index) ||
-				index >= nr_pages)
-			return -EINVAL;
-
-		nr_pages = 1;
-		mode = PAGE_WRITEBACK;
-	}
-
-	down_read(&zram->init_lock);
-	if (!init_done(zram)) {
-		ret = -EINVAL;
-		goto release_init_lock;
-	}
-
-	if (!zram->backing_dev) {
-		ret = -ENODEV;
-		goto release_init_lock;
-	}
-
-	page = alloc_page(GFP_KERNEL);
-	if (!page) {
-		ret = -ENOMEM;
-		goto release_init_lock;
-	}
-
-	for (; nr_pages != 0; index++, nr_pages--) {
-		struct bio_vec bvec;
-
-		bvec.bv_page = page;
-		bvec.bv_len = PAGE_SIZE;
-		bvec.bv_offset = 0;
-
-		spin_lock(&zram->wb_limit_lock);
-		if (zram->wb_limit_enable && !zram->bd_wb_limit) {
-			spin_unlock(&zram->wb_limit_lock);
-			ret = -EIO;
-			break;
-		}
-		spin_unlock(&zram->wb_limit_lock);
-
-		if (!blk_idx) {
-			blk_idx = alloc_block_bdev(zram);
-			if (!blk_idx) {
-				ret = -ENOSPC;
-				break;
-			}
-		}
-
-		zram_slot_lock(zram, index);
-		if (!zram_allocated(zram, index))
-			goto next;
-
-		if (zram_test_flag(zram, index, ZRAM_WB) ||
-				zram_test_flag(zram, index, ZRAM_SAME) ||
-				zram_test_flag(zram, index, ZRAM_UNDER_WB))
-			goto next;
-
-		if (mode & IDLE_WRITEBACK &&
-			  !zram_test_flag(zram, index, ZRAM_IDLE))
-			goto next;
-		if (mode & HUGE_WRITEBACK &&
-			  !zram_test_flag(zram, index, ZRAM_HUGE))
-			goto next;
-		/*
-		 * Clearing ZRAM_UNDER_WB is duty of caller.
-		 * IOW, zram_free_page never clear it.
-		 */
-		zram_set_flag(zram, index, ZRAM_UNDER_WB);
-		/* Need for hugepage writeback racing */
-		zram_set_flag(zram, index, ZRAM_IDLE);
-		zram_slot_unlock(zram, index);
-		if (zram_bvec_read(zram, &bvec, index, 0, NULL)) {
-			zram_slot_lock(zram, index);
-			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
-			zram_clear_flag(zram, index, ZRAM_IDLE);
-			zram_slot_unlock(zram, index);
-			continue;
-		}
-
-		bio_init(&bio, zram->bdev, &bio_vec, 1,
-			 REQ_OP_WRITE | REQ_SYNC);
-		bio.bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
-
-		bio_add_page(&bio, bvec.bv_page, bvec.bv_len,
-				bvec.bv_offset);
-		/*
-		 * XXX: A single page IO would be inefficient for write
-		 * but it would be not bad as starter.
-		 */
-		err = submit_bio_wait(&bio);
-		if (err) {
-			zram_slot_lock(zram, index);
-			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
-			zram_clear_flag(zram, index, ZRAM_IDLE);
-			zram_slot_unlock(zram, index);
-			/*
-			 * Return last IO error unless every IO were
-			 * not suceeded.
-			 */
-			ret = err;
-			continue;
-		}
-
-		atomic64_inc(&zram->stats.bd_writes);
-		/*
-		 * We released zram_slot_lock so need to check if the slot was
-		 * changed. If there is freeing for the slot, we can catch it
-		 * easily by zram_allocated.
-		 * A subtle case is the slot is freed/reallocated/marked as
-		 * ZRAM_IDLE again. To close the race, idle_store doesn't
-		 * mark ZRAM_IDLE once it found the slot was ZRAM_UNDER_WB.
-		 * Thus, we could close the race by checking ZRAM_IDLE bit.
-		 */
-		zram_slot_lock(zram, index);
-		if (!zram_allocated(zram, index) ||
-			  !zram_test_flag(zram, index, ZRAM_IDLE)) {
-			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
-			zram_clear_flag(zram, index, ZRAM_IDLE);
-			goto next;
-		}
-
-		zram_free_page(zram, index);
-		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
-		zram_set_flag(zram, index, ZRAM_WB);
-		zram_set_element(zram, index, blk_idx);
-		blk_idx = 0;
-		atomic64_inc(&zram->stats.pages_stored);
-		spin_lock(&zram->wb_limit_lock);
-		if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
-			zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
-		spin_unlock(&zram->wb_limit_lock);
-next:
-		zram_slot_unlock(zram, index);
-	}
-
-	if (blk_idx)
-		free_block_bdev(zram, blk_idx);
-	__free_page(page);
-release_init_lock:
-	up_read(&zram->init_lock);
-
-	return ret;
-}
-
-struct zram_work {
-	struct work_struct work;
-	struct zram *zram;
-	unsigned long entry;
-	struct bio *bio;
-	struct bio_vec bvec;
-};
-
-#if PAGE_SIZE != 4096
-static void zram_sync_read(struct work_struct *work)
-{
-	struct zram_work *zw = container_of(work, struct zram_work, work);
-	struct zram *zram = zw->zram;
-	unsigned long entry = zw->entry;
-	struct bio *bio = zw->bio;
-
-	read_from_bdev_async(zram, &zw->bvec, entry, bio);
-}
-
-/*
- * Block layer want one ->submit_bio to be active at a time, so if we use
- * chained IO with parent IO in same context, it's a deadlock. To avoid that,
- * use a worker thread context.
- */
-static int read_from_bdev_sync(struct zram *zram, struct bio_vec *bvec,
-				unsigned long entry, struct bio *bio)
-{
-	struct zram_work work;
-
-	work.bvec = *bvec;
-	work.zram = zram;
-	work.entry = entry;
-	work.bio = bio;
-
-	INIT_WORK_ONSTACK(&work.work, zram_sync_read);
-	queue_work(system_unbound_wq, &work.work);
-	flush_work(&work.work);
-	destroy_work_on_stack(&work.work);
-
-	return 1;
-}
-#else
-static int read_from_bdev_sync(struct zram *zram, struct bio_vec *bvec,
-				unsigned long entry, struct bio *bio)
-{
-	WARN_ON(1);
-	return -EIO;
-}
-#endif
-
-static int read_from_bdev(struct zram *zram, struct bio_vec *bvec,
-			unsigned long entry, struct bio *parent, bool sync)
-{
-	atomic64_inc(&zram->stats.bd_reads);
-	if (sync)
-		return read_from_bdev_sync(zram, bvec, entry, parent);
-	else
-		return read_from_bdev_async(zram, bvec, entry, parent);
-}
-#else
-static inline void reset_bdev(struct zram *zram) {};
-static int read_from_bdev(struct zram *zram, struct bio_vec *bvec,
-			unsigned long entry, struct bio *parent, bool sync)
-{
-	return -EIO;
-}
-
-static void free_block_bdev(struct zram *zram, unsigned long blk_idx) {};
-#endif
-
-#ifdef CONFIG_ZRAM_MEMORY_TRACKING
-
-static struct dentry *zram_debugfs_root;
-
-static void zram_debugfs_create(void)
-{
-	zram_debugfs_root = debugfs_create_dir("zram", NULL);
-}
-
-static void zram_debugfs_destroy(void)
-{
-	debugfs_remove_recursive(zram_debugfs_root);
-}
-
-static void zram_accessed(struct zram *zram, u32 index)
-{
-	zram_clear_flag(zram, index, ZRAM_IDLE);
-	zram->table[index].ac_time = ktime_get_boottime();
-}
-
-static ssize_t read_block_state(struct file *file, char __user *buf,
-				size_t count, loff_t *ppos)
-{
-	char *kbuf;
-	ssize_t index, written = 0;
-	struct zram *zram = file->private_data;
-	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
-	struct timespec64 ts;
-
-	kbuf = kvmalloc(count, GFP_KERNEL);
-	if (!kbuf)
-		return -ENOMEM;
-
-	down_read(&zram->init_lock);
-	if (!init_done(zram)) {
-		up_read(&zram->init_lock);
-		kvfree(kbuf);
-		return -EINVAL;
-	}
-
-	for (index = *ppos; index < nr_pages; index++) {
-		int copied;
-
-		zram_slot_lock(zram, index);
-		if (!zram_allocated(zram, index))
-			goto next;
-
-		ts = ktime_to_timespec64(zram->table[index].ac_time);
-		copied = snprintf(kbuf + written, count,
-			"%12zd %12lld.%06lu %c%c%c%c\n",
-			index, (s64)ts.tv_sec,
-			ts.tv_nsec / NSEC_PER_USEC,
-			zram_test_flag(zram, index, ZRAM_SAME) ? 's' : '.',
-			zram_test_flag(zram, index, ZRAM_WB) ? 'w' : '.',
-			zram_test_flag(zram, index, ZRAM_HUGE) ? 'h' : '.',
-			zram_test_flag(zram, index, ZRAM_IDLE) ? 'i' : '.');
-
-		if (count <= copied) {
-			zram_slot_unlock(zram, index);
-			break;
-		}
-		written += copied;
-		count -= copied;
-next:
-		zram_slot_unlock(zram, index);
-		*ppos += 1;
-	}
-
-	up_read(&zram->init_lock);
-	if (copy_to_user(buf, kbuf, written))
-		written = -EFAULT;
-	kvfree(kbuf);
-
-	return written;
-}
-
-static const struct file_operations proc_zram_block_state_op = {
-	.open = simple_open,
-	.read = read_block_state,
-	.llseek = default_llseek,
-};
-
-static void zram_debugfs_register(struct zram *zram)
-{
-	if (!zram_debugfs_root)
-		return;
-
-	zram->debugfs_dir = debugfs_create_dir(zram->disk->disk_name,
-						zram_debugfs_root);
-	debugfs_create_file("block_state", 0400, zram->debugfs_dir,
-				zram, &proc_zram_block_state_op);
-}
-
-static void zram_debugfs_unregister(struct zram *zram)
-{
-	debugfs_remove_recursive(zram->debugfs_dir);
-}
-#else
-static void zram_debugfs_create(void) {};
-static void zram_debugfs_destroy(void) {};
-static void zram_accessed(struct zram *zram, u32 index)
-{
-	zram_clear_flag(zram, index, ZRAM_IDLE);
-};
-static void zram_debugfs_register(struct zram *zram) {};
-static void zram_debugfs_unregister(struct zram *zram) {};
-#endif
-
-/*
- * We switched to per-cpu streams and this attr is not needed anymore.
- * However, we will keep it around for some time, because:
- * a) we may revert per-cpu streams in the future
- * b) it's visible to user space and we need to follow our 2 years
- *    retirement rule; but we already have a number of 'soon to be
- *    altered' attrs, so max_comp_streams need to wait for the next
- *    layoff cycle.
- */
-static ssize_t max_comp_streams_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	return scnprintf(buf, PAGE_SIZE, "%d\n", num_online_cpus());
-}
-
-static ssize_t max_comp_streams_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	return len;
-}
-
-static ssize_t comp_algorithm_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	size_t sz;
-	struct zram *zram = dev_to_zram(dev);
-
-	down_read(&zram->init_lock);
-	sz = zcomp_available_show(zram->compressor, buf);
-	up_read(&zram->init_lock);
-
-	return sz;
-}
-
-static ssize_t comp_algorithm_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	struct zram *zram = dev_to_zram(dev);
-	char compressor[ARRAY_SIZE(zram->compressor)];
-	size_t sz;
-
-	strscpy(compressor, buf, sizeof(compressor));
-	/* ignore trailing newline */
-	sz = strlen(compressor);
-	if (sz > 0 && compressor[sz - 1] == '\n')
-		compressor[sz - 1] = 0x00;
-
-	if (!zcomp_available_algorithm(compressor))
-		return -EINVAL;
-
-	down_write(&zram->init_lock);
-	if (init_done(zram)) {
-		up_write(&zram->init_lock);
-		pr_info("Can't change algorithm for initialized device\n");
-		return -EBUSY;
-	}
-
-	strcpy(zram->compressor, compressor);
-	up_write(&zram->init_lock);
-	return len;
-}
-
-static ssize_t compact_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	struct zram *zram = dev_to_zram(dev);
-
-	down_read(&zram->init_lock);
-	if (!init_done(zram)) {
-		up_read(&zram->init_lock);
-		return -EINVAL;
-	}
-
-	zs_compact(zram->mem_pool);
-	up_read(&zram->init_lock);
-
-	return len;
-}
-
-static ssize_t io_stat_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct zram *zram = dev_to_zram(dev);
-	ssize_t ret;
-
-	down_read(&zram->init_lock);
-	ret = scnprintf(buf, PAGE_SIZE,
-			"%8llu %8llu %8llu %8llu\n",
-			(u64)atomic64_read(&zram->stats.failed_reads),
-			(u64)atomic64_read(&zram->stats.failed_writes),
-			(u64)atomic64_read(&zram->stats.invalid_io),
-			(u64)atomic64_read(&zram->stats.notify_free));
-	up_read(&zram->init_lock);
-
-	return ret;
-}
-
-static ssize_t mm_stat_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct zram *zram = dev_to_zram(dev);
-	struct zs_pool_stats pool_stats;
-	u64 orig_size, mem_used = 0;
-	long max_used;
-	ssize_t ret;
-
-	memset(&pool_stats, 0x00, sizeof(struct zs_pool_stats));
-
-	down_read(&zram->init_lock);
-	if (init_done(zram)) {
-		mem_used = zs_get_total_pages(zram->mem_pool);
-		zs_pool_stats(zram->mem_pool, &pool_stats);
-	}
-
-	orig_size = atomic64_read(&zram->stats.pages_stored);
-	max_used = atomic_long_read(&zram->stats.max_used_pages);
-
-	ret = scnprintf(buf, PAGE_SIZE,
-			"%8llu %8llu %8llu %8lu %8ld %8llu %8lu %8llu %8llu\n",
-			orig_size << PAGE_SHIFT,
-			(u64)atomic64_read(&zram->stats.compr_data_size),
-			mem_used << PAGE_SHIFT,
-			zram->limit_pages << PAGE_SHIFT,
-			max_used << PAGE_SHIFT,
-			(u64)atomic64_read(&zram->stats.same_pages),
-			atomic_long_read(&pool_stats.pages_compacted),
-			(u64)atomic64_read(&zram->stats.huge_pages),
-			(u64)atomic64_read(&zram->stats.huge_pages_since));
-	up_read(&zram->init_lock);
-
-	return ret;
-}
-
-#ifdef CONFIG_ZRAM_WRITEBACK
-#define FOUR_K(x) ((x) * (1 << (PAGE_SHIFT - 12)))
-static ssize_t bd_stat_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct zram *zram = dev_to_zram(dev);
-	ssize_t ret;
-
-	down_read(&zram->init_lock);
-	ret = scnprintf(buf, PAGE_SIZE,
-		"%8llu %8llu %8llu\n",
-			FOUR_K((u64)atomic64_read(&zram->stats.bd_count)),
-			FOUR_K((u64)atomic64_read(&zram->stats.bd_reads)),
-			FOUR_K((u64)atomic64_read(&zram->stats.bd_writes)));
-	up_read(&zram->init_lock);
-
-	return ret;
-}
-#endif
-
-static ssize_t debug_stat_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	int version = 1;
-	struct zram *zram = dev_to_zram(dev);
-	ssize_t ret;
-
-	down_read(&zram->init_lock);
-	ret = scnprintf(buf, PAGE_SIZE,
-			"version: %d\n%8llu %8llu\n",
-			version,
-			(u64)atomic64_read(&zram->stats.writestall),
-			(u64)atomic64_read(&zram->stats.miss_free));
-	up_read(&zram->init_lock);
-
-	return ret;
-}
-
-static DEVICE_ATTR_RO(io_stat);
-static DEVICE_ATTR_RO(mm_stat);
-#ifdef CONFIG_ZRAM_WRITEBACK
-static DEVICE_ATTR_RO(bd_stat);
-#endif
-static DEVICE_ATTR_RO(debug_stat);
-
-static void zram_meta_free(struct zram *zram, u64 disksize)
-{
-	size_t num_pages = disksize >> PAGE_SHIFT;
-	size_t index;
-
-	if (!zram->table)
-		return;
-
-	/* Free all pages that are still in this zram device */
-	for (index = 0; index < num_pages; index++)
-		zram_free_page(zram, index);
-
-	zs_destroy_pool(zram->mem_pool);
-	vfree(zram->table);
-	zram->table = NULL;
-}
-
-static bool zram_meta_alloc(struct zram *zram, u64 disksize)
-{
-	size_t num_pages;
-
-	num_pages = disksize >> PAGE_SHIFT;
-	zram->table = vzalloc(array_size(num_pages, sizeof(*zram->table)));
-	if (!zram->table)
-		return false;
-
-	zram->mem_pool = zs_create_pool(zram->disk->disk_name);
-	if (!zram->mem_pool) {
-		vfree(zram->table);
-		zram->table = NULL;
-		return false;
-	}
-
-	if (!huge_class_size)
-		huge_class_size = zs_huge_class_size(zram->mem_pool);
-	return true;
-}
-
-/*
- * To protect concurrent access to the same index entry,
- * caller should hold this table index entry's bit_spinlock to
- * indicate this index entry is accessing.
- */
-static void zram_free_page(struct zram *zram, size_t index)
-{
-	unsigned long handle;
-
-#ifdef CONFIG_ZRAM_MEMORY_TRACKING
-	zram->table[index].ac_time = 0;
-#endif
-	if (zram_test_flag(zram, index, ZRAM_IDLE))
-		zram_clear_flag(zram, index, ZRAM_IDLE);
-
-	if (zram_test_flag(zram, index, ZRAM_HUGE)) {
-		zram_clear_flag(zram, index, ZRAM_HUGE);
-		atomic64_dec(&zram->stats.huge_pages);
-	}
-
-	if (zram_test_flag(zram, index, ZRAM_WB)) {
-		zram_clear_flag(zram, index, ZRAM_WB);
-		free_block_bdev(zram, zram_get_element(zram, index));
-		goto out;
-	}
-
-	/*
-	 * No memory is allocated for same element filled pages.
-	 * Simply clear same page flag.
-	 */
-	if (zram_test_flag(zram, index, ZRAM_SAME)) {
-		zram_clear_flag(zram, index, ZRAM_SAME);
-		atomic64_dec(&zram->stats.same_pages);
-		goto out;
-	}
-
-	handle = zram_get_handle(zram, index);
-	if (!handle)
-		return;
-
-	zs_free(zram->mem_pool, handle);
-
-	atomic64_sub(zram_get_obj_size(zram, index),
-			&zram->stats.compr_data_size);
-out:
-	atomic64_dec(&zram->stats.pages_stored);
-	zram_set_handle(zram, index, 0);
-	zram_set_obj_size(zram, index, 0);
-	WARN_ON_ONCE(zram->table[index].flags &
-		~(1UL << ZRAM_LOCK | 1UL << ZRAM_UNDER_WB));
-}
-
-static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,
-				struct bio *bio, bool partial_io)
-{
-	struct zcomp_strm *zstrm;
-	unsigned long handle;
-	unsigned int size;
-	void *src, *dst;
-	int ret;
-
-	zram_slot_lock(zram, index);
-	if (zram_test_flag(zram, index, ZRAM_WB)) {
-		struct bio_vec bvec;
-
-		zram_slot_unlock(zram, index);
-		/* A null bio means rw_page was used, we must fallback to bio */
-		if (!bio)
-			return -EOPNOTSUPP;
-
-		bvec.bv_page = page;
-		bvec.bv_len = PAGE_SIZE;
-		bvec.bv_offset = 0;
-		return read_from_bdev(zram, &bvec,
-				zram_get_element(zram, index),
-				bio, partial_io);
-	}
-
-	handle = zram_get_handle(zram, index);
-	if (!handle || zram_test_flag(zram, index, ZRAM_SAME)) {
-		unsigned long value;
-		void *mem;
-
-		value = handle ? zram_get_element(zram, index) : 0;
-		mem = kmap_atomic(page);
-		zram_fill_page(mem, PAGE_SIZE, value);
-		kunmap_atomic(mem);
-		zram_slot_unlock(zram, index);
-		return 0;
-	}
-
-	size = zram_get_obj_size(zram, index);
-
-	if (size != PAGE_SIZE)
-		zstrm = zcomp_stream_get(zram->comp);
-
-	src = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);
-	if (size == PAGE_SIZE) {
-		dst = kmap_atomic(page);
-		memcpy(dst, src, PAGE_SIZE);
-		kunmap_atomic(dst);
-		ret = 0;
-	} else {
-		dst = kmap_atomic(page);
-		ret = zcomp_decompress(zstrm, src, size, dst);
-		kunmap_atomic(dst);
-		zcomp_stream_put(zram->comp);
-	}
-	zs_unmap_object(zram->mem_pool, handle);
-	zram_slot_unlock(zram, index);
-
-	/* Should NEVER happen. Return bio error if it does. */
-	if (WARN_ON(ret))
-		pr_err("Decompression failed! err=%d, page=%u\n", ret, index);
-
-	return ret;
-}
-
-static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,
-				u32 index, int offset, struct bio *bio)
-{
-	int ret;
-	struct page *page;
-
-	page = bvec->bv_page;
-	if (is_partial_io(bvec)) {
-		/* Use a temporary buffer to decompress the page */
-		page = alloc_page(GFP_NOIO|__GFP_HIGHMEM);
-		if (!page)
-			return -ENOMEM;
-	}
-
-	ret = __zram_bvec_read(zram, page, index, bio, is_partial_io(bvec));
-	if (unlikely(ret))
-		goto out;
-
-	if (is_partial_io(bvec)) {
-		void *src = kmap_atomic(page);
-
-		memcpy_to_bvec(bvec, src + offset);
-		kunmap_atomic(src);
-	}
-out:
-	if (is_partial_io(bvec))
-		__free_page(page);
-
-	return ret;
-}
-
-static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
-				u32 index, struct bio *bio)
-{
-	int ret = 0;
-	unsigned long alloced_pages;
-	unsigned long handle = -ENOMEM;
-	unsigned int comp_len = 0;
-	void *src, *dst, *mem;
-	struct zcomp_strm *zstrm;
-	struct page *page = bvec->bv_page;
-	unsigned long element = 0;
-	enum zram_pageflags flags = 0;
-
-	mem = kmap_atomic(page);
-	if (page_same_filled(mem, &element)) {
-		kunmap_atomic(mem);
-		/* Free memory associated with this sector now. */
-		flags = ZRAM_SAME;
-		atomic64_inc(&zram->stats.same_pages);
-		goto out;
-	}
-	kunmap_atomic(mem);
-
-compress_again:
-	zstrm = zcomp_stream_get(zram->comp);
-	src = kmap_atomic(page);
-	ret = zcomp_compress(zstrm, src, &comp_len);
-	kunmap_atomic(src);
-
-	if (unlikely(ret)) {
-		zcomp_stream_put(zram->comp);
-		pr_err("Compression failed! err=%d\n", ret);
-		zs_free(zram->mem_pool, handle);
-		return ret;
-	}
-
-	if (comp_len >= huge_class_size)
-		comp_len = PAGE_SIZE;
-	/*
-	 * handle allocation has 2 paths:
-	 * a) fast path is executed with preemption disabled (for
-	 *  per-cpu streams) and has __GFP_DIRECT_RECLAIM bit clear,
-	 *  since we can't sleep;
-	 * b) slow path enables preemption and attempts to allocate
-	 *  the page with __GFP_DIRECT_RECLAIM bit set. we have to
-	 *  put per-cpu compression stream and, thus, to re-do
-	 *  the compression once handle is allocated.
-	 *
-	 * if we have a 'non-null' handle here then we are coming
-	 * from the slow path and handle has already been allocated.
-	 */
-	if (IS_ERR((void *)handle))
-		handle = zs_malloc(zram->mem_pool, comp_len,
-				__GFP_KSWAPD_RECLAIM |
-				__GFP_NOWARN |
-				__GFP_HIGHMEM |
-				__GFP_MOVABLE |
-				__GFP_CMA);
-	if (IS_ERR((void *)handle)) {
-		zcomp_stream_put(zram->comp);
-		atomic64_inc(&zram->stats.writestall);
-		handle = zs_malloc(zram->mem_pool, comp_len,
-				GFP_NOIO | __GFP_HIGHMEM |
-				__GFP_MOVABLE | __GFP_CMA);
-		if (IS_ERR((void *)handle))
-			return PTR_ERR((void *)handle);
-
-		if (comp_len != PAGE_SIZE)
-			goto compress_again;
-		/*
-		 * If the page is not compressible, you need to acquire the
-		 * lock and execute the code below. The zcomp_stream_get()
-		 * call is needed to disable the cpu hotplug and grab the
-		 * zstrm buffer back. It is necessary that the dereferencing
-		 * of the zstrm variable below occurs correctly.
-		 */
-		zstrm = zcomp_stream_get(zram->comp);
-	}
-
-	alloced_pages = zs_get_total_pages(zram->mem_pool);
-	update_used_max(zram, alloced_pages);
-
-	if (zram->limit_pages && alloced_pages > zram->limit_pages) {
-		zcomp_stream_put(zram->comp);
-		zs_free(zram->mem_pool, handle);
-		return -ENOMEM;
-	}
-
-	dst = zs_map_object(zram->mem_pool, handle, ZS_MM_WO);
-
-	src = zstrm->buffer;
-	if (comp_len == PAGE_SIZE)
-		src = kmap_atomic(page);
-	memcpy(dst, src, comp_len);
-	if (comp_len == PAGE_SIZE)
-		kunmap_atomic(src);
-
-	zcomp_stream_put(zram->comp);
-	zs_unmap_object(zram->mem_pool, handle);
-	atomic64_add(comp_len, &zram->stats.compr_data_size);
-out:
-	/*
-	 * Free memory associated with this sector
-	 * before overwriting unused sectors.
-	 */
-	zram_slot_lock(zram, index);
-	zram_free_page(zram, index);
-
-	if (comp_len == PAGE_SIZE) {
-		zram_set_flag(zram, index, ZRAM_HUGE);
-		atomic64_inc(&zram->stats.huge_pages);
-		atomic64_inc(&zram->stats.huge_pages_since);
-	}
-
-	if (flags) {
-		zram_set_flag(zram, index, flags);
-		zram_set_element(zram, index, element);
-	}  else {
-		zram_set_handle(zram, index, handle);
-		zram_set_obj_size(zram, index, comp_len);
-	}
-	zram_slot_unlock(zram, index);
-
-	/* Update stats */
-	atomic64_inc(&zram->stats.pages_stored);
-	return ret;
-}
-
-static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
-				u32 index, int offset, struct bio *bio)
-{
-	int ret;
-	struct page *page = NULL;
-	struct bio_vec vec;
-
-	vec = *bvec;
-	if (is_partial_io(bvec)) {
-		void *dst;
-		/*
-		 * This is a partial IO. We need to read the full page
-		 * before to write the changes.
-		 */
-		page = alloc_page(GFP_NOIO|__GFP_HIGHMEM);
-		if (!page)
-			return -ENOMEM;
-
-		ret = __zram_bvec_read(zram, page, index, bio, true);
-		if (ret)
-			goto out;
-
-		dst = kmap_atomic(page);
-		memcpy_from_bvec(dst + offset, bvec);
-		kunmap_atomic(dst);
-
-		vec.bv_page = page;
-		vec.bv_len = PAGE_SIZE;
-		vec.bv_offset = 0;
-	}
-
-	ret = __zram_bvec_write(zram, &vec, index, bio);
-out:
-	if (is_partial_io(bvec))
-		__free_page(page);
-	return ret;
-}
-
-/*
- * zram_bio_discard - handler on discard request
- * @index: physical block index in PAGE_SIZE units
- * @offset: byte offset within physical block
- */
-static void zram_bio_discard(struct zram *zram, u32 index,
-			     int offset, struct bio *bio)
-{
-	size_t n = bio->bi_iter.bi_size;
-
-	/*
-	 * zram manages data in physical block size units. Because logical block
-	 * size isn't identical with physical block size on some arch, we
-	 * could get a discard request pointing to a specific offset within a
-	 * certain physical block.  Although we can handle this request by
-	 * reading that physiclal block and decompressing and partially zeroing
-	 * and re-compressing and then re-storing it, this isn't reasonable
-	 * because our intent with a discard request is to save memory.  So
-	 * skipping this logical block is appropriate here.
-	 */
-	if (offset) {
-		if (n <= (PAGE_SIZE - offset))
-			return;
-
-		n -= (PAGE_SIZE - offset);
-		index++;
-	}
-
-	while (n >= PAGE_SIZE) {
-		zram_slot_lock(zram, index);
-		zram_free_page(zram, index);
-		zram_slot_unlock(zram, index);
-		atomic64_inc(&zram->stats.notify_free);
-		index++;
-		n -= PAGE_SIZE;
-	}
-}
-
-/*
- * Returns errno if it has some problem. Otherwise return 0 or 1.
- * Returns 0 if IO request was done synchronously
- * Returns 1 if IO request was successfully submitted.
- */
-static int zram_bvec_rw(struct zram *zram, struct bio_vec *bvec, u32 index,
-			int offset, enum req_op op, struct bio *bio)
-{
-	int ret;
-
-	if (!op_is_write(op)) {
-		atomic64_inc(&zram->stats.num_reads);
-		ret = zram_bvec_read(zram, bvec, index, offset, bio);
-		flush_dcache_page(bvec->bv_page);
-	} else {
-		atomic64_inc(&zram->stats.num_writes);
-		ret = zram_bvec_write(zram, bvec, index, offset, bio);
-	}
-
-	zram_slot_lock(zram, index);
-	zram_accessed(zram, index);
-	zram_slot_unlock(zram, index);
-
-	if (unlikely(ret < 0)) {
-		if (!op_is_write(op))
-			atomic64_inc(&zram->stats.failed_reads);
-		else
-			atomic64_inc(&zram->stats.failed_writes);
-	}
-
-	return ret;
-}
-
-static void __zram_make_request(struct zram *zram, struct bio *bio)
-{
-	int offset;
-	u32 index;
-	struct bio_vec bvec;
-	struct bvec_iter iter;
-	unsigned long start_time;
-
-	index = bio->bi_iter.bi_sector >> SECTORS_PER_PAGE_SHIFT;
-	offset = (bio->bi_iter.bi_sector &
-		  (SECTORS_PER_PAGE - 1)) << SECTOR_SHIFT;
-
-	switch (bio_op(bio)) {
-	case REQ_OP_DISCARD:
-	case REQ_OP_WRITE_ZEROES:
-		zram_bio_discard(zram, index, offset, bio);
-		bio_endio(bio);
-		return;
-	default:
-		break;
-	}
-
-	start_time = bio_start_io_acct(bio);
-	bio_for_each_segment(bvec, bio, iter) {
-		struct bio_vec bv = bvec;
-		unsigned int unwritten = bvec.bv_len;
-
-		do {
-			bv.bv_len = min_t(unsigned int, PAGE_SIZE - offset,
-							unwritten);
-			if (zram_bvec_rw(zram, &bv, index, offset,
-					 bio_op(bio), bio) < 0) {
-				bio->bi_status = BLK_STS_IOERR;
-				break;
-			}
-
-			bv.bv_offset += bv.bv_len;
-			unwritten -= bv.bv_len;
-
-			update_position(&index, &offset, &bv);
-		} while (unwritten);
-	}
-	bio_end_io_acct(bio, start_time);
-	bio_endio(bio);
-}
-
-/*
- * Handler function for all zram I/O requests.
- */
-static void zram_submit_bio(struct bio *bio)
-{
-	struct zram *zram = bio->bi_bdev->bd_disk->private_data;
-
-	if (!valid_io_request(zram, bio->bi_iter.bi_sector,
-					bio->bi_iter.bi_size)) {
-		atomic64_inc(&zram->stats.invalid_io);
-		bio_io_error(bio);
-		return;
-	}
-
-	__zram_make_request(zram, bio);
-}
-
-static void zram_slot_free_notify(struct block_device *bdev,
-				unsigned long index)
-{
-	struct zram *zram;
-
-	zram = bdev->bd_disk->private_data;
-
-	atomic64_inc(&zram->stats.notify_free);
-	if (!zram_slot_trylock(zram, index)) {
-		atomic64_inc(&zram->stats.miss_free);
-		return;
-	}
-
-	zram_free_page(zram, index);
-	zram_slot_unlock(zram, index);
-}
-
-static int zram_rw_page(struct block_device *bdev, sector_t sector,
-		       struct page *page, enum req_op op)
-{
-	int offset, ret;
-	u32 index;
-	struct zram *zram;
-	struct bio_vec bv;
-	unsigned long start_time;
-
-	if (PageTransHuge(page))
-		return -ENOTSUPP;
-	zram = bdev->bd_disk->private_data;
-
-	if (!valid_io_request(zram, sector, PAGE_SIZE)) {
-		atomic64_inc(&zram->stats.invalid_io);
-		ret = -EINVAL;
-		goto out;
-	}
-
-	index = sector >> SECTORS_PER_PAGE_SHIFT;
-	offset = (sector & (SECTORS_PER_PAGE - 1)) << SECTOR_SHIFT;
-
-	bv.bv_page = page;
-	bv.bv_len = PAGE_SIZE;
-	bv.bv_offset = 0;
-
-	start_time = bdev_start_io_acct(bdev->bd_disk->part0,
-			SECTORS_PER_PAGE, op, jiffies);
-	ret = zram_bvec_rw(zram, &bv, index, offset, op, NULL);
-	bdev_end_io_acct(bdev->bd_disk->part0, op, start_time);
-out:
-	/*
-	 * If I/O fails, just return error(ie, non-zero) without
-	 * calling page_endio.
-	 * It causes resubmit the I/O with bio request by upper functions
-	 * of rw_page(e.g., swap_readpage, __swap_writepage) and
-	 * bio->bi_end_io does things to handle the error
-	 * (e.g., SetPageError, set_page_dirty and extra works).
-	 */
-	if (unlikely(ret < 0))
-		return ret;
-
-	switch (ret) {
-	case 0:
-		page_endio(page, op_is_write(op), 0);
-		break;
-	case 1:
-		ret = 0;
-		break;
-	default:
-		WARN_ON(1);
-	}
-	return ret;
-}
-
-static void zram_reset_device(struct zram *zram)
-{
-	down_write(&zram->init_lock);
-
-	zram->limit_pages = 0;
-
-	set_capacity_and_notify(zram->disk, 0);
-	part_stat_set_all(zram->disk->part0, 0);
-
-	/* I/O operation under all of CPU are done so let's free */
-	zram_meta_free(zram, zram->disksize);
-	zram->disksize = 0;
-	memset(&zram->stats, 0, sizeof(zram->stats));
-	if (zram->comp)
-		zcomp_destroy(zram->comp);
-	zram->comp = NULL;
-	reset_bdev(zram);
-
-	up_write(&zram->init_lock);
-}
-
-static ssize_t disksize_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	u64 disksize;
-	struct zcomp *comp;
-	struct zram *zram = dev_to_zram(dev);
-	int err;
-
-	disksize = memparse(buf, NULL);
-	if (!disksize)
-		return -EINVAL;
-
-	down_write(&zram->init_lock);
-	if (init_done(zram)) {
-		pr_info("Cannot change disksize for initialized device\n");
-		err = -EBUSY;
-		goto out_unlock;
-	}
-
-	disksize = PAGE_ALIGN(disksize);
-	if (!zram_meta_alloc(zram, disksize)) {
-		err = -ENOMEM;
-		goto out_unlock;
-	}
-
-	comp = zcomp_create(zram->compressor);
-	if (IS_ERR(comp)) {
-		pr_err("Cannot initialise %s compressing backend\n",
-				zram->compressor);
-		err = PTR_ERR(comp);
-		goto out_free_meta;
-	}
-
-	zram->comp = comp;
-	zram->disksize = disksize;
-	set_capacity_and_notify(zram->disk, zram->disksize >> SECTOR_SHIFT);
-	up_write(&zram->init_lock);
-
-	return len;
-
-out_free_meta:
-	zram_meta_free(zram, disksize);
-out_unlock:
-	up_write(&zram->init_lock);
-	return err;
-}
-
-static ssize_t reset_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	int ret;
-	unsigned short do_reset;
-	struct zram *zram;
-	struct gendisk *disk;
-
-	ret = kstrtou16(buf, 10, &do_reset);
-	if (ret)
-		return ret;
-
-	if (!do_reset)
-		return -EINVAL;
-
-	zram = dev_to_zram(dev);
-	disk = zram->disk;
-
-	mutex_lock(&disk->open_mutex);
-	/* Do not reset an active device or claimed device */
-	if (disk_openers(disk) || zram->claim) {
-		mutex_unlock(&disk->open_mutex);
-		return -EBUSY;
-	}
-
-	/* From now on, anyone can't open /dev/zram[0-9] */
-	zram->claim = true;
-	mutex_unlock(&disk->open_mutex);
-
-	/* Make sure all the pending I/O are finished */
-	sync_blockdev(disk->part0);
-	zram_reset_device(zram);
-
-	mutex_lock(&disk->open_mutex);
-	zram->claim = false;
-	mutex_unlock(&disk->open_mutex);
-
-	return len;
-}
-
-static int zram_open(struct block_device *bdev, fmode_t mode)
-{
-	int ret = 0;
-	struct zram *zram;
-
-	WARN_ON(!mutex_is_locked(&bdev->bd_disk->open_mutex));
-
-	zram = bdev->bd_disk->private_data;
-	/* zram was claimed to reset so open request fails */
-	if (zram->claim)
-		ret = -EBUSY;
-
-	return ret;
-}
-
-static const struct block_device_operations zram_devops = {
-	.open = zram_open,
-	.submit_bio = zram_submit_bio,
-	.swap_slot_free_notify = zram_slot_free_notify,
-	.rw_page = zram_rw_page,
-	.owner = THIS_MODULE
-};
-
-static DEVICE_ATTR_WO(compact);
-static DEVICE_ATTR_RW(disksize);
-static DEVICE_ATTR_RO(initstate);
-static DEVICE_ATTR_WO(reset);
-static DEVICE_ATTR_WO(mem_limit);
-static DEVICE_ATTR_WO(mem_used_max);
-static DEVICE_ATTR_WO(idle);
-static DEVICE_ATTR_RW(max_comp_streams);
-static DEVICE_ATTR_RW(comp_algorithm);
-#ifdef CONFIG_ZRAM_WRITEBACK
-static DEVICE_ATTR_RW(backing_dev);
-static DEVICE_ATTR_WO(writeback);
-static DEVICE_ATTR_RW(writeback_limit);
-static DEVICE_ATTR_RW(writeback_limit_enable);
-#endif
-
-static struct attribute *zram_disk_attrs[] = {
-	&dev_attr_disksize.attr,
-	&dev_attr_initstate.attr,
-	&dev_attr_reset.attr,
-	&dev_attr_compact.attr,
-	&dev_attr_mem_limit.attr,
-	&dev_attr_mem_used_max.attr,
-	&dev_attr_idle.attr,
-	&dev_attr_max_comp_streams.attr,
-	&dev_attr_comp_algorithm.attr,
-#ifdef CONFIG_ZRAM_WRITEBACK
-	&dev_attr_backing_dev.attr,
-	&dev_attr_writeback.attr,
-	&dev_attr_writeback_limit.attr,
-	&dev_attr_writeback_limit_enable.attr,
-#endif
-	&dev_attr_io_stat.attr,
-	&dev_attr_mm_stat.attr,
-#ifdef CONFIG_ZRAM_WRITEBACK
-	&dev_attr_bd_stat.attr,
-#endif
-	&dev_attr_debug_stat.attr,
-	NULL,
-};
-
-ATTRIBUTE_GROUPS(zram_disk);
-
-/*
- * Allocate and initialize new zram device. the function returns
- * '>= 0' device_id upon success, and negative value otherwise.
- */
-static int zram_add(void)
-{
-	struct zram *zram;
-	int ret, device_id;
-
-	zram = kzalloc(sizeof(struct zram), GFP_KERNEL);
-	if (!zram)
-		return -ENOMEM;
-
-	ret = idr_alloc(&zram_index_idr, zram, 0, 0, GFP_KERNEL);
-	if (ret < 0)
-		goto out_free_dev;
-	device_id = ret;
-
-	init_rwsem(&zram->init_lock);
-#ifdef CONFIG_ZRAM_WRITEBACK
-	spin_lock_init(&zram->wb_limit_lock);
-#endif
-
-	/* gendisk structure */
-	zram->disk = blk_alloc_disk(NUMA_NO_NODE);
-	if (!zram->disk) {
-		pr_err("Error allocating disk structure for device %d\n",
-			device_id);
-		ret = -ENOMEM;
-		goto out_free_idr;
-	}
-
-	zram->disk->major = zram_major;
-	zram->disk->first_minor = device_id;
-	zram->disk->minors = 1;
-	zram->disk->flags |= GENHD_FL_NO_PART;
-	zram->disk->fops = &zram_devops;
-	zram->disk->private_data = zram;
-	snprintf(zram->disk->disk_name, 16, "zram%d", device_id);
-
-	/* Actual capacity set using syfs (/sys/block/zram<id>/disksize */
-	set_capacity(zram->disk, 0);
-	/* zram devices sort of resembles non-rotational disks */
-	blk_queue_flag_set(QUEUE_FLAG_NONROT, zram->disk->queue);
-	blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, zram->disk->queue);
-
-	/*
-	 * To ensure that we always get PAGE_SIZE aligned
-	 * and n*PAGE_SIZED sized I/O requests.
-	 */
-	blk_queue_physical_block_size(zram->disk->queue, PAGE_SIZE);
-	blk_queue_logical_block_size(zram->disk->queue,
-					ZRAM_LOGICAL_BLOCK_SIZE);
-	blk_queue_io_min(zram->disk->queue, PAGE_SIZE);
-	blk_queue_io_opt(zram->disk->queue, PAGE_SIZE);
-	zram->disk->queue->limits.discard_granularity = PAGE_SIZE;
-	blk_queue_max_discard_sectors(zram->disk->queue, UINT_MAX);
-
-	/*
-	 * zram_bio_discard() will clear all logical blocks if logical block
-	 * size is identical with physical block size(PAGE_SIZE). But if it is
-	 * different, we will skip discarding some parts of logical blocks in
-	 * the part of the request range which isn't aligned to physical block
-	 * size.  So we can't ensure that all discarded logical blocks are
-	 * zeroed.
-	 */
-	if (ZRAM_LOGICAL_BLOCK_SIZE == PAGE_SIZE)
-		blk_queue_max_write_zeroes_sectors(zram->disk->queue, UINT_MAX);
-
-	blk_queue_flag_set(QUEUE_FLAG_STABLE_WRITES, zram->disk->queue);
-	ret = device_add_disk(NULL, zram->disk, zram_disk_groups);
-	if (ret)
-		goto out_cleanup_disk;
-
-	strscpy(zram->compressor, default_compressor, sizeof(zram->compressor));
-
-	zram_debugfs_register(zram);
-	pr_info("Added device: %s\n", zram->disk->disk_name);
-	return device_id;
-
-out_cleanup_disk:
-	put_disk(zram->disk);
-out_free_idr:
-	idr_remove(&zram_index_idr, device_id);
-out_free_dev:
-	kfree(zram);
-	return ret;
-}
-
-static int zram_remove(struct zram *zram)
-{
-	bool claimed;
-
-	mutex_lock(&zram->disk->open_mutex);
-	if (disk_openers(zram->disk)) {
-		mutex_unlock(&zram->disk->open_mutex);
-		return -EBUSY;
-	}
-
-	claimed = zram->claim;
-	if (!claimed)
-		zram->claim = true;
-	mutex_unlock(&zram->disk->open_mutex);
-
-	zram_debugfs_unregister(zram);
-
-	if (claimed) {
-		/*
-		 * If we were claimed by reset_store(), del_gendisk() will
-		 * wait until reset_store() is done, so nothing need to do.
-		 */
-		;
-	} else {
-		/* Make sure all the pending I/O are finished */
-		sync_blockdev(zram->disk->part0);
-		zram_reset_device(zram);
-	}
-
-	pr_info("Removed device: %s\n", zram->disk->disk_name);
-
-	del_gendisk(zram->disk);
-
-	/* del_gendisk drains pending reset_store */
-	WARN_ON_ONCE(claimed && zram->claim);
-
-	/*
-	 * disksize_store() may be called in between zram_reset_device()
-	 * and del_gendisk(), so run the last reset to avoid leaking
-	 * anything allocated with disksize_store()
-	 */
-	zram_reset_device(zram);
-
-	put_disk(zram->disk);
-	kfree(zram);
-	return 0;
-}
-
-/* zram-control sysfs attributes */
-
-/*
- * NOTE: hot_add attribute is not the usual read-only sysfs attribute. In a
- * sense that reading from this file does alter the state of your system -- it
- * creates a new un-initialized zram device and returns back this device's
- * device_id (or an error code if it fails to create a new device).
- */
-static ssize_t hot_add_show(struct class *class,
-			struct class_attribute *attr,
-			char *buf)
-{
-	int ret;
-
-	mutex_lock(&zram_index_mutex);
-	ret = zram_add();
-	mutex_unlock(&zram_index_mutex);
-
-	if (ret < 0)
-		return ret;
-	return scnprintf(buf, PAGE_SIZE, "%d\n", ret);
-}
-static struct class_attribute class_attr_hot_add =
-	__ATTR(hot_add, 0400, hot_add_show, NULL);
-
-static ssize_t hot_remove_store(struct class *class,
-			struct class_attribute *attr,
-			const char *buf,
-			size_t count)
-{
-	struct zram *zram;
-	int ret, dev_id;
-
-	/* dev_id is gendisk->first_minor, which is `int' */
-	ret = kstrtoint(buf, 10, &dev_id);
-	if (ret)
-		return ret;
-	if (dev_id < 0)
-		return -EINVAL;
-
-	mutex_lock(&zram_index_mutex);
-
-	zram = idr_find(&zram_index_idr, dev_id);
-	if (zram) {
-		ret = zram_remove(zram);
-		if (!ret)
-			idr_remove(&zram_index_idr, dev_id);
-	} else {
-		ret = -ENODEV;
-	}
-
-	mutex_unlock(&zram_index_mutex);
-	return ret ? ret : count;
-}
-static CLASS_ATTR_WO(hot_remove);
-
-static struct attribute *zram_control_class_attrs[] = {
-	&class_attr_hot_add.attr,
-	&class_attr_hot_remove.attr,
-	NULL,
-};
-ATTRIBUTE_GROUPS(zram_control_class);
-
-static struct class zram_control_class = {
-	.name		= "zram-control",
-	.owner		= THIS_MODULE,
-	.class_groups	= zram_control_class_groups,
-};
-
-static int zram_remove_cb(int id, void *ptr, void *data)
-{
-	WARN_ON_ONCE(zram_remove(ptr));
-	return 0;
-}
-
-static void destroy_devices(void)
-{
-	class_unregister(&zram_control_class);
-	idr_for_each(&zram_index_idr, &zram_remove_cb, NULL);
-	zram_debugfs_destroy();
-	idr_destroy(&zram_index_idr);
-	unregister_blkdev(zram_major, "zram");
-	cpuhp_remove_multi_state(CPUHP_ZCOMP_PREPARE);
-}
-
-static int __init zram_init(void)
-{
-	int ret;
-
-	BUILD_BUG_ON(__NR_ZRAM_PAGEFLAGS > BITS_PER_LONG);
-
-	ret = cpuhp_setup_state_multi(CPUHP_ZCOMP_PREPARE, "block/zram:prepare",
-				      zcomp_cpu_up_prepare, zcomp_cpu_dead);
-	if (ret < 0)
-		return ret;
-
-	ret = class_register(&zram_control_class);
-	if (ret) {
-		pr_err("Unable to register zram-control class\n");
-		cpuhp_remove_multi_state(CPUHP_ZCOMP_PREPARE);
-		return ret;
-	}
-
-	zram_debugfs_create();
-	zram_major = register_blkdev(0, "zram");
-	if (zram_major <= 0) {
-		pr_err("Unable to get major number\n");
-		class_unregister(&zram_control_class);
-		cpuhp_remove_multi_state(CPUHP_ZCOMP_PREPARE);
-		return -EBUSY;
-	}
-
-	while (num_devices != 0) {
-		mutex_lock(&zram_index_mutex);
-		ret = zram_add();
-		mutex_unlock(&zram_index_mutex);
-		if (ret < 0)
-			goto out_error;
-		num_devices--;
-	}
-
-	return 0;
-
-out_error:
-	destroy_devices();
-	return ret;
-}
-
-static void __exit zram_exit(void)
-{
-	destroy_devices();
-}
-
-module_init(zram_init);
-module_exit(zram_exit);
-
-module_param(num_devices, uint, 0);
-MODULE_PARM_DESC(num_devices, "Number of pre-created zram devices");
-
-MODULE_LICENSE("Dual BSD/GPL");
-MODULE_AUTHOR("Nitin Gupta <ngupta@vflare.org>");
-MODULE_DESCRIPTION("Compressed RAM Block Device");
+#  All unpinned blobs below are extracted from warm UKQ1.240624.001 V816.0.10.0.UGVINXM - warm_in_global-ota_full-V816.0.10.0.UGVINXM
+
+# ACDB
+vendor/etc/acdbdata/IDP_UPD/IDP_UPD_acdb_cal.acdb
+vendor/etc/acdbdata/IDP_UPD/IDP_UPD_workspaceFileXml.qwsp
+vendor/etc/acdbdata/ffv_models/ffv__5.0.1_0.1__3.0.0_0.0__eai_2.10_enpu3.pmd
+vendor/etc/acdbdata/ffv_models/ffv__5.0.1_0.1__eai_2.10_enpu3.pmd
+vendor/etc/acdbdata/ffv_models/ffv__5.0.2_0.1__3.0.0_0.0__eai_3.5_adsp.pmd
+vendor/etc/acdbdata/ffv_models/ffv__6.2.5_0.1__eai_3.4__enpu_v4.pmd
+vendor/etc/acdbdata/ffv_models/ffv__7.0.1_0.1__eai_3.4_enpu_v4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.0.0_0.1__3.0.0_0.0__3.1.0_0.0__3.2.0_0.0__eai_2.7_enpu3.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.0.0_0.1__3.0.0_0.0__3.1.2_0.0__3.2.0_0.1__eai_3.4_adsp.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.0.0_0.1__3.0.0_0.0__eai_1.36_enpu2.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.0.0_1.0__3.0.0_0.0__3.1.2_0.0__3.2.0_0.1__eai_3.4_adsp.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.3.0_0.1__3.0.0_0.0__eai_1.10.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.3.0_0.1__3.0.0_0.0__eai_1.36_enpu2_comp.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.6.3_0.0__3.0.0_0.0__3.1.1.0_0.0__3.2.0_0.0__eai_2.7_enpu_v3.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.6.3_0.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_3.0_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.6.5_0.0__3.0.0_0.0__3.1.0_0.0__3.2.0_0.0__eai_2.10_enpuv3.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.7.20_0.0__3.0.0_0.0__eai_1.36_enpu2.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.7.2_0.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_3.4_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.7.2_0.0__3.0.0_0.0__eai_1.36_enpu2.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.7.5_0.0__3.0.0_0.0__3.1.1.0_0.0__3.2.0_0.0__eai_2.7_enpu_v3.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.7.5_0.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_3.0_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.7.6_0.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_3.4_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.7.7_0.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_3.4_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.7.8_0.0__3.0.0_0.0__3.1.0_0.0__3.2.0_0.0__eai_2.10_enpuv3.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.7.8_0.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_3.0_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.9.0_1.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_3.4_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.9.2_0.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_3.4_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__2.9.2_1.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.0__eai_3.4_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__4.6.2_0.0__3.0.0_0.0__3.1.2_0.0__3.2.0_0.1__eai_3.4_adsp.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__4.6.2_1.0__3.0.0_0.0__3.1.2_0.0__3.2.0_0.1__eai_3.4_adsp.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__4.8.12_0.0__3.0.0_0.0__3.1.2_0.0__3.2.0_0.1__eai_3.4_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__4.8.12_0.0__3.0.0_0.0__eai_1.43_enpu2.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__4.8.14_0.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_1.43_enpu2.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__4.8.14_1.0__3.0.0_0.0__3.1.2_0.0__3.2.0_0.1__eai_3.4_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__4.8.2_0.0__3.0.0_0.0__3.1.1.0_0.0__3.2.0_0.0__eai_2.7_enpu_v3.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__4.8.3_0.0__3.0.0_0.0__3.1.0_0.0__3.2.0_0.0__eai_2.10_enpuv3.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__4.8.4_0.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_3.0_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__4.8.4_0.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_3.4_enpuv4.pmd
+vendor/etc/acdbdata/nn_ns_models/fai__8.0.2_0.0__3.0.0_0.0__3.1.1_0.0__3.2.0_0.1__eai_3.4_enpuv4.pmd
+vendor/etc/acdbdata/nn_vad_models/fai__3.0.0_0.0__eai_1.36_enpu2.pmd
+vendor/etc/acdbdata/nn_vad_models/fai__3.0.0_0.0__eai_2.10_enpuv3.pmd
+vendor/etc/acdbdata/nn_vad_models/fai__3.0.0_0.0__eai_3.4_enpuv4.pmd
+vendor/etc/acdbdata/pitti_idp/IDP_acdb_cal.acdb
+vendor/etc/acdbdata/pitti_idp/IDP_workspaceFileXml.qwsp
+vendor/etc/acdbdata/pitti_qrd/QRD_acdb_cal.acdb
+vendor/etc/acdbdata/pitti_qrd/QRD_workspaceFileXml.qwsp
+
+# ADSP
+vendor/bin/adsprpcd
+vendor/etc/init/vendor.qti.adsprpc-guestos-service.rc
+vendor/lib64/libadsp_default_listener.so
+vendor/lib64/libvmmem.so
+
+# ADSP modules
+vendor/lib/rfsa/adsp/libSnpeHtpV68Skel.so
+vendor/lib/rfsa/adsp/libSnpeHtpV69Skel.so
+vendor/lib/rfsa/adsp/libcalculator_skel.so
+vendor/lib/rfsa/adsp/libdsp_streamer_binning.so
+vendor/lib/rfsa/adsp/libsnpe_dsp_v65_domains_v2_skel.so
+vendor/lib/rfsa/adsp/libsnpe_dsp_v66_domains_v2_skel.so
+vendor/lib/rfsa/adsp/misound_karaoke_res.bin
+vendor/lib/rfsa/adsp/misound_karaokemix_res.bin
+vendor/lib/rfsa/adsp/misound_res_headphone.bin
+vendor/lib/rfsa/adsp/misound_res_spk.bin
+
+# Audio configs
+vendor/etc/audio/sku_pitti/mixer_paths_pitti_idp.xml
+vendor/etc/audio/sku_pitti/mixer_paths_pitti_qrd.xml
+vendor/etc/audio/sku_pitti/resourcemanager_pitti_idp.xml
+vendor/etc/audio/sku_pitti/resourcemanager_pitti_qrd.xml
+vendor/etc/backend_conf.xml
+vendor/etc/usecaseKvManager.xml
+vendor/etc/audio_diag.cfg
+vendor/etc/card-defs.xml
+vendor/etc/kvh2xml.xml
+vendor/etc/microphone_characteristics.xml
+
+# Audio graph manager
+vendor/lib64/libagm.so
+vendor/lib64/libagmmixer.so
+vendor/lib64/libmisight.so
+vendor/lib64/vendor.qti.hardware.AGMIPC@1.0-impl.so
+
+# Audio libraries
+vendor/etc/models/acd/environment.eai
+vendor/etc/models/acd/event.eai
+vendor/etc/models/acd/music.eai
+vendor/etc/models/acd/speech.eai
+vendor/lib64/hw/audio.primary.pitti.so
+vendor/lib64/libVoiceSdk.so
+vendor/lib64/libadm.so
+vendor/lib64/libadsprpc.so
+vendor/lib64/libar-acdb.so
+vendor/lib64/libar-gpr.so
+vendor/lib64/libar-gsl.so
+vendor/lib64/libar-pal.so
+vendor/lib64/libarmemlog.so
+vendor/lib64/libats.so
+vendor/lib64/libaudio_log_utils.so
+vendor/lib64/libaudiofeaturestats.so
+vendor/lib64/libcapiv2svacnnvendor.so
+vendor/lib64/libcapiv2svarnnvendor.so
+vendor/lib64/libcapiv2udk7vendor.so
+vendor/lib64/libcapiv2uvvendor.so
+vendor/lib64/libcustomva_intf.so
+vendor/lib64/libhotword_intf.so
+vendor/lib64/libkaraokepal.so
+vendor/lib64/liblx-ar_util.so
+vendor/lib64/liblx-osal.so
+vendor/lib64/libmcs.so
+vendor/lib64/libpal_net_if.so
+vendor/lib64/libpalclient.so
+vendor/lib64/libqtigefar.so
+vendor/lib64/libtensorflowlite_c.so
+vendor/lib64/libvui_intf.so
+vendor/lib64/vendor.qti.hardware.pal@1.0-impl.so
+vendor/lib64/vendor.qti.voiceprint@1.0.so
+
+# Audio soundfx
+vendor/lib64/soundfx/libasphere.so
+vendor/lib64/soundfx/libquasar.so
+vendor/lib64/soundfx/libshoebox.so
+
+# Bluetooth
+vendor/bin/hw/android.hardware.bluetooth@1.1-service-qti
+vendor/etc/init/android.hardware.bluetooth@1.1-service-qti.rc
+vendor/etc/vintf/manifest/bttpi-saidl.xml
+vendor/lib64/btaudio_offload_if.so
+vendor/lib64/hw/android.hardware.bluetooth.audio-impl-qti.so
+vendor/lib64/hw/android.hardware.bluetooth@1.0-impl-qti.so
+vendor/lib64/hw/android.hardware.bluetooth@1.1-impl-qti.so
+vendor/lib64/hw/audio.bluetooth_qti.default.so
+vendor/lib64/hw/vendor.qti.hardware.bluetooth_audio@2.0-impl.so
+vendor/lib64/hw/vendor.qti.hardware.bluetooth_audio@2.1-impl.so
+vendor/lib64/hw/vendor.qti.hardware.bluetooth_sar@1.1-impl.so
+vendor/lib64/hw/vendor.qti.hardware.btconfigstore@1.0-impl.so
+vendor/lib64/hw/vendor.qti.hardware.btconfigstore@2.0-impl.so
+vendor/lib64/hw/vendor.qti.hardware.bttpi-impl.so
+vendor/lib64/libbluetooth_audio_session_aidl_qti.so
+vendor/lib64/libbluetooth_audio_session_qti.so
+vendor/lib64/libbluetooth_audio_session_qti_2_1.so
+vendor/lib64/libbt-hidlclient.so
+vendor/lib64/libbtnv.so
+vendor/lib64/libsoc_helper.so
+vendor/lib64/vendor.qti.hardware.bluetooth_sar@1.0.so
+vendor/lib64/vendor.qti.hardware.bluetooth_sar@1.1.so
+vendor/lib64/vendor.qti.hardware.bttpi-V3-ndk.so
+vendor/lib64/vendor.qti.hardware.fm@1.0.so
+
+# CDSP
+vendor/lib64/libcdsp_default_listener.so
+vendor/lib64/libcdsprpc.so
+vendor/lib64/libmdsprpc.so
+vendor/lib64/libsdsprpc.so
+
+# CNE
+vendor/app/CneApp/CneApp.apk;REQUIRED=CneApp.libvndfwk_detect_jni.qti_vendor_symlink
+vendor/bin/cnd
+vendor/bin/qms
+vendor/etc/default-permissions/com.qualcomm.qti.cne.xml
+vendor/etc/init/cnd.rc
+vendor/etc/init/qms.rc
+vendor/etc/seccomp_policy/qms.policy
+vendor/etc/vintf/manifest/qcrilhook-saidl.xml
+vendor/etc/vintf/manifest/qms-saidl.xml
+vendor/etc/vintf/manifest/vendor.qti.hardware.data.connectionaidl.xml
+vendor/etc/vintf/manifest/vendor.qti.hardware.data.iwlandata.xml
+vendor/lib64/libCneAppJni.so
+vendor/lib64/libWlanServiceJni.so
+vendor/lib64/libcne.so
+vendor/lib64/libcneapiclient.so
+vendor/lib64/libcneoplookup.so
+vendor/lib64/libcneqmiutils.so
+vendor/lib64/libmasc.so
+vendor/lib64/libqms.so
+vendor/lib64/libqms_client.so
+vendor/lib64/libshsc.so
+vendor/lib64/libwms.so
+vendor/lib64/libwqe.so
+vendor/lib64/libxml.so
+vendor/lib64/vendor.qti.data.factoryservice-V1-ndk.so
+vendor/lib64/vendor.qti.data.slm@1.0.so
+vendor/lib64/vendor.qti.hardware.cacert@1.0.so
+vendor/lib64/vendor.qti.hardware.data.cneaidlservice.internal.api-V1-ndk.so
+vendor/lib64/vendor.qti.hardware.data.cneaidlservice.internal.constants-V1-ndk.so
+vendor/lib64/vendor.qti.hardware.data.cneaidlservice.internal.server-V1-ndk.so
+vendor/lib64/vendor.qti.hardware.data.connection@1.0.so
+vendor/lib64/vendor.qti.hardware.data.connection@1.1.so
+vendor/lib64/vendor.qti.hardware.data.connectionaidl-V1-ndk.so
+vendor/lib64/vendor.qti.hardware.data.dynamicdds@1.0.so
+vendor/lib64/vendor.qti.hardware.data.dynamicdds@1.1.so
+vendor/lib64/vendor.qti.hardware.data.dynamicddsaidlservice-V1-ndk.so
+vendor/lib64/vendor.qti.hardware.data.flow@1.0.so
+vendor/lib64/vendor.qti.hardware.data.flow@1.1.so
+vendor/lib64/vendor.qti.hardware.data.flowaidlservice-V1-ndk.so
+vendor/lib64/vendor.qti.hardware.data.iwlandata-V1-ndk.so
+vendor/lib64/vendor.qti.hardware.data.latency@1.0.so
+vendor/lib64/vendor.qti.hardware.data.lce@1.0.so
+vendor/lib64/vendor.qti.hardware.data.lceaidlservice-V1-ndk.so
+vendor/lib64/vendor.qti.hardware.data.qmiaidlservice-V1-ndk.so
+vendor/lib64/vendor.qti.hardware.slmadapter@1.0.so
+vendor/lib64/vendor.qti.latency@2.0.so
+vendor/lib64/vendor.qti.latency@2.1.so
+vendor/lib64/vendor.qti.latency@2.2.so
+vendor/lib64/vendor.qti.latencyaidlservice-V1-ndk.so
+
+# CNE Configs
+vendor/etc/cne/mwqem.conf
+vendor/etc/cne/profileMwqem.xml
+vendor/etc/cne/wqeclient/ATT/ATT_profile1.xml
+vendor/etc/cne/wqeclient/ATT/ATT_profile2.xml
+vendor/etc/cne/wqeclient/ATT/ATT_profile3.xml
+vendor/etc/cne/wqeclient/ATT/ATT_profile4.xml
+vendor/etc/cne/wqeclient/ATT/ATT_profile5.xml
+vendor/etc/cne/wqeclient/ATT/ATT_profile6.xml
+vendor/etc/cne/wqeclient/ATT/ATT_profile7.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile1.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile15.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile16.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile17.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile18.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile19.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile2.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile20.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile21.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile3.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile32.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile4.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile5.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile6.xml
+vendor/etc/cne/wqeclient/ROW/ROW_profile7.xml
+vendor/etc/cne/wqeclient/VZW/VZW_profile1.xml
+vendor/etc/cne/wqeclient/VZW/VZW_profile2.xml
+vendor/etc/cne/wqeclient/VZW/VZW_profile3.xml
+vendor/etc/cne/wqeclient/VZW/VZW_profile4.xml
+vendor/etc/cne/wqeclient/VZW/VZW_profile5.xml
+vendor/etc/cne/wqeclient/VZW/VZW_profile6.xml
+vendor/etc/cne/wqeclient/VZW/VZW_profile7.xml
+
+# Camera
+odm/etc/camera/cameraopt.json
+vendor/bin/hw/vendor.qti.camera.provider-service_64
+vendor/etc/camera/model/preview/back/sg_pre_model
+vendor/etc/camera/model/preview/front/model_m/sg_pre_model
+vendor/etc/camera/model/snapshot/back/capture_cache
+vendor/etc/camera/model/snapshot/back/capture_model
+vendor/etc/camera/model/snapshot/back/capture_policy
+vendor/etc/camera/model/snapshot/front/sg_cap_cache
+vendor/etc/camera/model/snapshot/front/sg_cap_model
+vendor/etc/camera/model/snapshot/front/sg_cap_policy
+vendor/etc/camera/resources/model/2722133617
+vendor/etc/camera/resources/render/BuildIn/Material/1166466556_252005700
+vendor/etc/camera/resources/render/BuildIn/Material/1166466556_2571257293
+vendor/etc/camera/resources/render/BuildIn/Material/1166466556_4025145477
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_BASE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_BLEND_COLOR_LAYER_WITH_MASK_Define_NORMAL_MASK_CHANNEL_TYPE_R_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_BLEND_IMAGE_LAYER_Define_MULTIPLY_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_BLEND_IMAGE_LAYER_Define_SOFT_LIGHT_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_BLEND_IMAGE_LAYER_WITH_MASK_Define_MULTIPLY_MASK_CHANNEL_TYPE_R_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_BLEND_IMAGE_LAYER_WITH_MASK_Define_SOFT_LIGHT_MASK_CHANNEL_TYPE_R_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_BRIGHT_EYE_PROCESS.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_BRIGHT_EYE_PROCESS_V2_WITH_PUPIL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_FUSE_OFFSET.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_NORMAL_MESH_WARP.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_NORMAL_MESH_WARP_Define_DEF_CATMULL_ROM.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_NORMAL_MESH_WARP_Define_ENABLE_EG_SUPPRESSION.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_NORMAL_MESH_WARP_Define_ENABLE_EG_SUPPRESSION_DEF_CATMULL_ROM.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_NORMAL_MESH_WARP_Define_ENABLE_EG_SUPPRESSION_ENABLE_UVMAP.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_NORMAL_MESH_WARP_Define_ENABLE_UVMAP.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_V2_FUSE_OFFSET_EYE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_V2_FUSE_OFFSET_NORMAL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_V2_FUSE_OFFSET_SPLITLR.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_V2_WARP_Define_ENABLE_EG_SUPPRESSION.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_V2_WARP_Define_ENABLE_EG_SUPPRESSION_DEF_CATMULL_ROM.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_V2_WARP_Define_ENABLE_EG_SUPPRESSION_ENABLE_UVMAP.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_WARP_Define_ENABLE_EG_SUPPRESSION.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_WARP_Define_ENABLE_EG_SUPPRESSION_DEF_CATMULL_ROM.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_FACIAL_REFINE_WARP_Define_ENABLE_EG_SUPPRESSION_ENABLE_UVMAP.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_GAUSS_BILATERAL_1D.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_GAUSS_FIX_KERNEL_1D.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_LUMA_TO_ALPHA.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_MEAN_BLUR.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_MEAN_BOX_2x2.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_NORMAL_LUT_512_512_Define_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_RETOUCH_FOGGY_MEANBLUR_1D.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_RETOUCH_FOGGY_MEANBLUR_1D_Define_USE_ALPHA_WEIGHT.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_RETOUCH_FOGGY_MERGE_MASK.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_RETOUCH_FOGGY_SIMPLE_PROCESS_ADVANCE_Define_CHANNEL_R.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_RETOUCH_FOGGY_VARIANCE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_RETOUCH_MOISTURIZING_PROCESS_NORMAL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_RETOUCH_MOISTURIZING_PROCESS_WITH_MASK_Define_MASK_CHANNEL_TYPE_R.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_RETOUCH_MOISTURIZING_WEIGHT_DATA.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_RETOUCH_TEXTURE_GUIDE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_RETOUCH_TEXTURE_PROCESS_NORMAL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_SINGLE_LABEL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_SPOTLESS_PROCESS_NORMAL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_SPOTLESS_PROCESS_WITH_SKIN_MASK.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_WARP_AFFINE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_WARP_NORMAL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/OGL_WARP_NORMAL_Define_WARP_TO_ROI.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_P010ToRGB10A2Orientation.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_RGB10A2ToP010Orientation.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_RGB10A2ToRGB10A2.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_RGBA2RGBAUtils.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_RGBA2YUVUtils.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_RGBA2YUVUtils_SWAP_UV.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_YUV2RGBAUtils.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_YUV2RGBAUtils_DEHAZE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_YUV2RGBAUtils_SWAP_UV.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_YUV2RGBAUtils_SWAP_UV_DEHAZE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_YUV2YUVUtils.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_YUV2YUVUtils_SWAP_UV.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders32/shader_YUVP010ToYUVP010.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_BASE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_BLEND_COLOR_LAYER_WITH_MASK_Define_NORMAL_MASK_CHANNEL_TYPE_R_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_BLEND_IMAGE_LAYER_Define_MULTIPLY_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_BLEND_IMAGE_LAYER_Define_SOFT_LIGHT_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_BLEND_IMAGE_LAYER_WITH_MASK_Define_MULTIPLY_MASK_CHANNEL_TYPE_R_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_BLEND_IMAGE_LAYER_WITH_MASK_Define_SOFT_LIGHT_MASK_CHANNEL_TYPE_R_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_BRIGHT_EYE_PROCESS.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_BRIGHT_EYE_PROCESS_V2_WITH_PUPIL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_FUSE_OFFSET.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_NORMAL_MESH_WARP.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_NORMAL_MESH_WARP_Define_DEF_CATMULL_ROM.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_NORMAL_MESH_WARP_Define_ENABLE_EG_SUPPRESSION.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_NORMAL_MESH_WARP_Define_ENABLE_EG_SUPPRESSION_DEF_CATMULL_ROM.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_NORMAL_MESH_WARP_Define_ENABLE_EG_SUPPRESSION_ENABLE_UVMAP.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_NORMAL_MESH_WARP_Define_ENABLE_UVMAP.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_V2_FUSE_OFFSET_EYE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_V2_FUSE_OFFSET_NORMAL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_V2_FUSE_OFFSET_SPLITLR.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_V2_WARP_Define_ENABLE_EG_SUPPRESSION.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_V2_WARP_Define_ENABLE_EG_SUPPRESSION_DEF_CATMULL_ROM.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_V2_WARP_Define_ENABLE_EG_SUPPRESSION_ENABLE_UVMAP.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_WARP_Define_ENABLE_EG_SUPPRESSION.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_WARP_Define_ENABLE_EG_SUPPRESSION_DEF_CATMULL_ROM.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_FACIAL_REFINE_WARP_Define_ENABLE_EG_SUPPRESSION_ENABLE_UVMAP.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_GAUSS_BILATERAL_1D.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_GAUSS_FIX_KERNEL_1D.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_LUMA_TO_ALPHA.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_MEAN_BLUR.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_MEAN_BOX_2x2.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_NORMAL_LUT_512_512_Define_FRAMEBUFFER_FETCH_ADRENO.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_RETOUCH_FOGGY_MEANBLUR_1D.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_RETOUCH_FOGGY_MEANBLUR_1D_Define_USE_ALPHA_WEIGHT.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_RETOUCH_FOGGY_MERGE_MASK.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_RETOUCH_FOGGY_SIMPLE_PROCESS_ADVANCE_Define_CHANNEL_R.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_RETOUCH_FOGGY_VARIANCE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_RETOUCH_MOISTURIZING_PROCESS_NORMAL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_RETOUCH_MOISTURIZING_PROCESS_WITH_MASK_Define_MASK_CHANNEL_TYPE_R.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_RETOUCH_MOISTURIZING_WEIGHT_DATA.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_RETOUCH_TEXTURE_GUIDE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_RETOUCH_TEXTURE_PROCESS_NORMAL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_SINGLE_LABEL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_SPOTLESS_PROCESS_NORMAL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_SPOTLESS_PROCESS_WITH_SKIN_MASK.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_WARP_AFFINE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_WARP_NORMAL.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/OGL_WARP_NORMAL_Define_WARP_TO_ROI.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_P010ToRGB10A2Orientation.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_RGB10A2ToP010Orientation.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_RGB10A2ToRGB10A2.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_RGBA2RGBAUtils.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_RGBA2YUVUtils.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_RGBA2YUVUtils_SWAP_UV.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_YUV2RGBAUtils.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_YUV2RGBAUtils_DEHAZE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_YUV2RGBAUtils_SWAP_UV.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_YUV2RGBAUtils_SWAP_UV_DEHAZE.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_YUV2YUVUtils.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_YUV2YUVUtils_SWAP_UV.bin
+vendor/etc/camera/resources/render/BuildIn/binShaders64/shader_YUVP010ToYUVP010.bin
+vendor/etc/camera/resources/render/Config/config_mode_all.json
+vendor/etc/camera/resources/render/Config/config_mode_front.json
+vendor/etc/camera/resources/render/Config/config_mode_front_video.json
+vendor/etc/camera/resources/render/Config/config_mode_rear.json
+vendor/etc/camera/resources/render/Effect/20_FaceRetouch/Effects/0_Spotless/FaceMask.bin
+vendor/etc/camera/resources/render/Effect/20_FaceRetouch/Effects/0_Spotless/effect.json
+vendor/etc/camera/resources/render/Effect/20_FaceRetouch/Effects/1_SkinSmoothClassical/BeautyMap.bin
+vendor/etc/camera/resources/render/Effect/20_FaceRetouch/Effects/1_SkinSmoothClassical/FaceMask.bin
+vendor/etc/camera/resources/render/Effect/20_FaceRetouch/Effects/1_SkinSmoothClassical/effect_capture.json
+vendor/etc/camera/resources/render/Effect/20_FaceRetouch/Effects/1_SkinSmoothClassical/effect_preview.json
+vendor/etc/camera/resources/render/Effect/20_FaceRetouch/Effects/2_SkinSmoothRear/FaceMask.bin
+vendor/etc/camera/resources/render/Effect/20_FaceRetouch/Effects/2_SkinSmoothRear/effect_capture.json
+vendor/etc/camera/resources/render/Effect/20_FaceRetouch/Effects/2_SkinSmoothRear/effect_preview.json
+vendor/etc/camera/resources/render/Effect/20_FaceRetouch/mode_front.json
+vendor/etc/camera/resources/render/Effect/20_FaceRetouch/mode_rear.json
+vendor/etc/camera/resources/render/Effect/30_BasicRetouch/Effects/0_BrightEye/LeftEye.bin
+vendor/etc/camera/resources/render/Effect/30_BasicRetouch/Effects/0_BrightEye/RightEye.bin
+vendor/etc/camera/resources/render/Effect/30_BasicRetouch/Effects/0_BrightEye/effect.json
+vendor/etc/camera/resources/render/Effect/30_BasicRetouch/Effects/0_BrightEyeV3/effect.json
+vendor/etc/camera/resources/render/Effect/30_BasicRetouch/Effects/0_BrightEyeV3/eye_pupil.bin
+vendor/etc/camera/resources/render/Effect/30_BasicRetouch/Effects/0_BrightEyeV3/left_eye.bin
+vendor/etc/camera/resources/render/Effect/30_BasicRetouch/Effects/0_BrightEyeV3/right_eye.bin
+vendor/etc/camera/resources/render/Effect/30_BasicRetouch/mode_base.json
+vendor/etc/camera/resources/render/Effect/40_FaceStereo/Effects/0_ModeFront/effect_capture.json
+vendor/etc/camera/resources/render/Effect/40_FaceStereo/Effects/0_ModeFront/effect_preview.json
+vendor/etc/camera/resources/render/Effect/40_FaceStereo/Effects/0_ModeFront/xr.bin
+vendor/etc/camera/resources/render/Effect/40_FaceStereo/mode_front.json
+vendor/etc/camera/resources/render/Effect/50_SkinTone/Effects/0_ModeFront/effect.json
+vendor/etc/camera/resources/render/Effect/50_SkinTone/Effects/0_ModeFront/filter.bin
+vendor/etc/camera/resources/render/Effect/50_SkinTone/mode_front.json
+vendor/etc/camera/resources/render/Effect/5_DLRetouch/mode_front.json
+vendor/etc/camera/resources/render/Effect/5_DLRetouch/mode_rear.json
+vendor/etc/camera/resources/render/Effect/60_Makeup/Effects/0_ModeFront/Eyebrow.bin
+vendor/etc/camera/resources/render/Effect/60_Makeup/Effects/0_ModeFront/effect_capture.json
+vendor/etc/camera/resources/render/Effect/60_Makeup/Effects/0_ModeFront/effect_preview.json
+vendor/etc/camera/resources/render/Effect/60_Makeup/Effects/0_ModeFront/sh.bin
+vendor/etc/camera/resources/render/Effect/60_Makeup/Effects/0_ModeFront/yyy.bin
+vendor/etc/camera/resources/render/Effect/60_Makeup/Effects/0_ModeFront/yyz.bin
+vendor/etc/camera/resources/render/Effect/60_Makeup/Effects/0_ModeFront/zc.bin
+vendor/etc/camera/resources/render/Effect/60_Makeup/mode_front.json
+vendor/etc/camera/resources/render/Effect/70_FacialRefine/Effects/0_ModeFront/effect_capture.json
+vendor/etc/camera/resources/render/Effect/70_FacialRefine/Effects/0_ModeFront/effect_preview.json
+vendor/etc/camera/resources/render/Effect/70_FacialRefine/Effects/0_ModeFront/eye_refine.bin
+vendor/etc/camera/resources/render/Effect/70_FacialRefine/Effects/0_ModeFront/facelift.bin
+vendor/etc/camera/resources/render/Effect/70_FacialRefine/mode_front.json
+vendor/etc/camera/resources/render/Effect/effect_list.json
+vendor/etc/camera/resources/render/Effect/effect_mode_clear.json
+vendor/etc/camera/resources/render/Effect/effect_mode_front.json
+vendor/etc/camera/resources/render/Effect/effect_mode_front_video.json
+vendor/etc/camera/resources/render/Effect/effect_mode_rear.json
+vendor/etc/camera/resources/render/GlobalConfig.json
+vendor/etc/camera/resources/TStools_default_param.json
+vendor/etc/camera/resources/Version.txt
+vendor/etc/camera/resources/default_param.json
+vendor/etc/camera/resources/truesight_config_front.json
+vendor/etc/camera/resources/truesight_config_front_video.json
+vendor/etc/camera/resources/truesight_config_rear.json
+vendor/etc/camera/resources/truesight_param.json
+vendor/etc/camera/resources/truesight_param_debug.json
+vendor/etc/camera/xiaomi/dualbokehsnapshot.json
+vendor/etc/camera/xiaomi/frontbokehsnapshot.json
+vendor/etc/camera/xiaomi/frontsinglesnapshot.json
+vendor/etc/camera/xiaomi/frontsupernightsnapshot.json
+vendor/etc/camera/xiaomi/manualsnapshot.json
+vendor/etc/camera/xiaomi/normalpreview.json
+vendor/etc/camera/xiaomi/normalsnapshot.json
+vendor/etc/camera/xiaomi/realsinglebokehsnapshot.json
+vendor/etc/camera/xiaomi/satsnapshot.json
+vendor/etc/camera/xiaomi/superhdsnapshot.json
+vendor/etc/camera/xiaomi/superlowlightsnapshot.json
+vendor/etc/camera/xiaomi/thirdpartysnapshot.json
+vendor/etc/camera/xiaomi/uwsuperlowlightshot.json
+vendor/etc/camera/102_SummerDay.png
+vendor/etc/camera/103_Fantasy.png
+vendor/etc/camera/104_Meet.png
+vendor/etc/camera/105_WindSing.png
+vendor/etc/camera/106_Lost.png
+vendor/etc/camera/107_Central.png
+vendor/etc/camera/108_NorthernEurope.png
+vendor/etc/camera/109_Rome.png
+vendor/etc/camera/110_BlackGold.png
+vendor/etc/camera/111_GreenOrange.png
+vendor/etc/camera/112_CyberPunk.png
+vendor/etc/camera/113_BlackIce.png
+vendor/etc/camera/121_Bleach.png
+vendor/etc/camera/122_Thriller.png
+vendor/etc/camera/123_TealOrange.png
+vendor/etc/camera/124_JapaneseStyle.png
+vendor/etc/camera/125_Latin.png
+vendor/etc/camera/126_Fantasy2.png
+vendor/etc/camera/127_Creamy.png
+vendor/etc/camera/128_Sepia.png
+vendor/etc/camera/129_Vivid.png
+vendor/etc/camera/130_Natural.png
+vendor/etc/camera/131_Monochrome.png
+vendor/etc/camera/132_MonochromeHighContrast.png
+vendor/etc/camera/133_MonochromeBrown.png
+vendor/etc/camera/134_MonochromeBlue.png
+vendor/etc/camera/135_Classical.png
+vendor/etc/camera/136_Filene.png
+vendor/etc/camera/137_GreenNight.png
+vendor/etc/camera/138_LiteratureAndArt.png
+vendor/etc/camera/139_OrangeHoney.png
+vendor/etc/camera/140_Romance.png
+vendor/etc/camera/141_FR500.png
+vendor/etc/camera/142_FE250.png
+vendor/etc/camera/143_RedLantern.png
+vendor/etc/camera/144_RedHero.png
+vendor/etc/camera/145_TactileBlackWhite.png
+vendor/etc/camera/146_TactileGreen.png
+vendor/etc/camera/147_Neutral.png
+vendor/etc/camera/148_Mild.png
+vendor/etc/camera/149_LilyWhite.png
+vendor/etc/camera/150_Bright.png
+vendor/etc/camera/151_Fresh.png
+vendor/etc/camera/152_Limpid.png
+vendor/etc/camera/153_KC64.png
+vendor/etc/camera/154_V250.png
+vendor/etc/camera/155_H400.png
+vendor/etc/camera/156_ColdWhite.png
+vendor/etc/camera/157_Native.png
+vendor/etc/camera/158_BWClassical.png
+vendor/etc/camera/159_Flowers.png
+vendor/etc/camera/anc_night_algo_cache
+vendor/etc/camera/anc_night_binary_cache
+vendor/etc/camera/anc_night_model
+vendor/etc/camera/anc_night_params.json
+vendor/etc/camera/beauty_config_cn.json
+vendor/etc/camera/beauty_config_gl.json
+vendor/etc/camera/camxoverridesettings.txt
+vendor/etc/camera/model_ai_dxo.dlc
+vendor/etc/camera/model_back.dlc
+vendor/etc/camera/model_front.dlc
+vendor/etc/camera/model_glass.dlc
+vendor/etc/camera/model_indoor.dlc
+vendor/etc/camera/morpho_image_refiner_tuning_params_king_hi556w_front_global_llhdr.xml
+vendor/etc/camera/morpho_image_refiner_tuning_params_shine_imx852_main_global_llhdr.xml
+vendor/etc/camera/morpho_image_refiner_tuning_params_truly_s5kjns_main_global_llhdr.xml
+vendor/etc/camera/morpho_image_refiner_tuning_params_truly_sc520cs_front_global_llhdr.xml
+vendor/etc/camera/morpho_mfnr_king_hi556w_front_global.xml
+vendor/etc/camera/morpho_mfnr_king_hi556w_front_global_third.xml
+vendor/etc/camera/morpho_mfnr_shine_imx852_main_global.xml
+vendor/etc/camera/morpho_mfnr_shine_imx852_main_global_2X.xml
+vendor/etc/camera/morpho_mfnr_shine_imx852_main_global_4X.xml
+vendor/etc/camera/morpho_mfnr_shine_imx852_main_global_50M.xml
+vendor/etc/camera/morpho_mfnr_shine_imx852_main_global_6X.xml
+vendor/etc/camera/morpho_mfnr_shine_imx852_main_global_third.xml
+vendor/etc/camera/morpho_mfnr_truly_s5kjns_main_global.xml
+vendor/etc/camera/morpho_mfnr_truly_s5kjns_main_global_2X.xml
+vendor/etc/camera/morpho_mfnr_truly_s5kjns_main_global_4X.xml
+vendor/etc/camera/morpho_mfnr_truly_s5kjns_main_global_50M.xml
+vendor/etc/camera/morpho_mfnr_truly_s5kjns_main_global_6X.xml
+vendor/etc/camera/morpho_mfnr_truly_s5kjns_main_global_third.xml
+vendor/etc/camera/morpho_mfnr_truly_sc520cs_front_global.xml
+vendor/etc/camera/morpho_mfnr_truly_sc520cs_front_global_third.xml
+vendor/etc/camera/sceneDetection.xml
+vendor/etc/camera/singlebokeh_mecp.bin
+vendor/etc/camera/xiaomiSceneDetection.xml
+vendor/etc/init/vendor.qti.camera.provider-service_64.rc
+vendor/etc/vintf/manifest/vendor.qti.camera.postproc-impl.xml
+vendor/etc/vintf/manifest/vendor.qti.camera.provider.xml
+vendor/lib64/camera/components/com.mi.node.tsskinbeautifier.so
+vendor/lib64/camera/components/com.qti.camx.chiiqutils.so
+vendor/lib64/camera/components/com.qti.eisv2.so
+vendor/lib64/camera/components/com.qti.eisv3.so
+vendor/lib64/camera/components/com.qti.hvx.addconstant.so
+vendor/lib64/camera/components/com.qti.hvx.binning.so
+vendor/lib64/camera/components/com.qti.node.MiFlip.so
+vendor/lib64/camera/components/com.qti.node.customhwnode.so
+vendor/lib64/camera/components/com.qti.node.depth.so
+vendor/lib64/camera/components/com.qti.node.dewarp.so
+vendor/lib64/camera/components/com.qti.node.dummyrtb.so
+vendor/lib64/camera/components/com.qti.node.dummysat.so
+vendor/lib64/camera/components/com.qti.node.eisv2.so
+vendor/lib64/camera/components/com.qti.node.eisv3.so
+vendor/lib64/camera/components/com.qti.node.fcv.so
+vendor/lib64/camera/components/com.qti.node.formatconversion.so
+vendor/lib64/camera/components/com.qti.node.gpu.so
+vendor/lib64/camera/components/com.qti.node.memcpy.so
+vendor/lib64/camera/components/com.qti.node.mialgocontrol.so
+vendor/lib64/camera/components/com.qti.node.mimovie.so
+vendor/lib64/camera/components/com.qti.node.ml.so
+vendor/lib64/camera/components/com.qti.node.photosolid.so
+vendor/lib64/camera/components/com.qti.node.remosaic.so
+vendor/lib64/camera/components/com.qti.node.stich.so
+vendor/lib64/camera/components/com.qti.node.swaidenoiser.so
+vendor/lib64/camera/components/com.qti.node.swbestats.so
+vendor/lib64/camera/components/com.qti.node.swcac.so
+vendor/lib64/camera/components/com.qti.node.swec.so
+vendor/lib64/camera/components/com.qti.node.swfusion.so
+vendor/lib64/camera/components/com.qti.node.swlsc.so
+vendor/lib64/camera/components/com.qti.node.swmctf.so
+vendor/lib64/camera/components/com.qti.node.swmfnr.so
+vendor/lib64/camera/components/com.qti.node.swpdpc.so
+vendor/lib64/camera/components/com.qti.node.swpreprocess.so
+vendor/lib64/camera/components/com.qti.node.swregistration.so
+vendor/lib64/camera/components/com.qti.stats.aec.so
+vendor/lib64/camera/components/com.qti.stats.aecwrapper.so
+vendor/lib64/camera/components/com.qti.stats.aecxcore.so
+vendor/lib64/camera/components/com.qti.stats.af.so
+vendor/lib64/camera/components/com.qti.stats.afd.so
+vendor/lib64/camera/components/com.qti.stats.afwrapper.so
+vendor/lib64/camera/components/com.qti.stats.asd.so
+vendor/lib64/camera/components/com.qti.stats.awb.so
+vendor/lib64/camera/components/com.qti.stats.awbwrapper.so
+vendor/lib64/camera/components/com.qti.stats.cnndriver.so
+vendor/lib64/camera/components/com.qti.stats.haf.so
+vendor/lib64/camera/components/com.qti.stats.hafoverride.so
+vendor/lib64/camera/components/com.qti.stats.pdlib.so
+vendor/lib64/camera/components/com.qti.stats.pdlibsony.so
+vendor/lib64/camera/components/com.qti.stats.pdlibwrapper.so
+vendor/lib64/camera/components/com.qtistatic.stats.aec.so
+vendor/lib64/camera/components/com.qtistatic.stats.af.so
+vendor/lib64/camera/components/com.qtistatic.stats.awb.so
+vendor/lib64/camera/components/com.qtistatic.stats.pdlib.so
+vendor/lib64/camera/components/libdepthmapwrapper_secure.so
+vendor/lib64/camera/camx_buildbins
+vendor/lib64/camera/com.qti.sensor.c3f2_king_hi556w_front_ii.so
+vendor/lib64/camera/com.qti.sensor.c3f2_shine_imx852_main_ii.so
+vendor/lib64/camera/com.qti.sensor.c3f2_truly_s5kjns_main_i.so
+vendor/lib64/camera/com.qti.sensor.c3f2_truly_sc520cs_front_i.so
+vendor/lib64/camera/com.qti.sensormodule.c3f2_king_hi556w_front_ii.bin
+vendor/lib64/camera/com.qti.sensormodule.c3f2_shine_imx852_main_ii.bin
+vendor/lib64/camera/com.qti.sensormodule.c3f2_truly_s5kjns_main_i.bin
+vendor/lib64/camera/com.qti.sensormodule.c3f2_truly_sc520cs_front_i.bin
+vendor/lib64/camera/com.qti.tuned.c3f2_king_hi556w_front_ii.bin
+vendor/lib64/camera/com.qti.tuned.c3f2_shine_imx852_main_ii.bin
+vendor/lib64/camera/com.qti.tuned.c3f2_truly_s5kjns_main_i.bin
+vendor/lib64/camera/com.qti.tuned.c3f2_truly_sc520cs_front_i.bin
+vendor/lib64/camera/com.qti.tuned.default.bin
+vendor/lib64/camx.device-impl.so
+vendor/lib64/camx.provider-impl.so
+vendor/lib64/com.qti.chiusecaseselector.so
+vendor/lib64/com.qti.feature2.anchorsync.so
+vendor/lib64/com.qti.feature2.demux.so
+vendor/lib64/com.qti.feature2.derivedoffline.so
+vendor/lib64/com.qti.feature2.frameselect.so
+vendor/lib64/com.qti.feature2.fusion.so
+vendor/lib64/com.qti.feature2.generic.so
+vendor/lib64/com.qti.feature2.gs.cedros.so
+vendor/lib64/com.qti.feature2.gs.kamorta.so
+vendor/lib64/com.qti.feature2.gs.kodiak.so
+vendor/lib64/com.qti.feature2.gs.mannar.so
+vendor/lib64/com.qti.feature2.gs.sdm865.so
+vendor/lib64/com.qti.feature2.gs.sm8350.so
+vendor/lib64/com.qti.feature2.hdr.so
+vendor/lib64/com.qti.feature2.mcreprocrt.so
+vendor/lib64/com.qti.feature2.memcpy.so
+vendor/lib64/com.qti.feature2.mfsr.so
+vendor/lib64/com.qti.feature2.ml.so
+vendor/lib64/com.qti.feature2.mux.so
+vendor/lib64/com.qti.feature2.photosolid.so
+vendor/lib64/com.qti.feature2.qcfa.so
+vendor/lib64/com.qti.feature2.rawhdr.so
+vendor/lib64/com.qti.feature2.realtimeserializer.so
+vendor/lib64/com.qti.feature2.rt.so
+vendor/lib64/com.qti.feature2.rtmcx.so
+vendor/lib64/com.qti.feature2.serializer.so
+vendor/lib64/com.qti.feature2.statsregeneration.so
+vendor/lib64/com.qti.feature2.stub.so
+vendor/lib64/com.qti.feature2.swmf.so
+vendor/lib64/com.qti.settings.kalpeni.so
+vendor/lib64/com.qti.settings.kamorta.so
+vendor/lib64/com.qti.settings.kodiak.so
+vendor/lib64/com.qti.settings.mannar.so
+vendor/lib64/com.qti.settings.sdm865.so
+vendor/lib64/com.qti.settings.sm8350.so
+vendor/lib64/com.qti.stats.common.so
+vendor/lib64/com.qualcomm.mcx.distortionmapper.so
+vendor/lib64/com.qualcomm.mcx.linearmapper.so
+vendor/lib64/com.qualcomm.mcx.policy.mfl.so
+vendor/lib64/com.qualcomm.qti.mcx.usecase.extension.so
+vendor/lib64/com.xiaomi.plugin.memcpy.so
+vendor/lib64/com.xiaomi.plugin.mfnr.so
+vendor/lib64/com.xiaomi.plugin.mibokeh.so
+vendor/lib64/com.xiaomi.plugin.morphohdr.so
+vendor/lib64/com.xiaomi.plugin.skinbeautifier.so
+vendor/lib64/com.xiaomi.plugin.superlowlight.so
+vendor/lib64/com.xiaomi.plugin.swflip.so
+vendor/lib64/hw/camera.qcom.so
+vendor/lib64/hw/com.qti.chi.override.so
+vendor/lib64/libMiVideoFilter.so
+vendor/lib64/libPlatformValidatorShared.so
+vendor/lib64/libSNPE.so
+vendor/lib64/libSnpeHtpPrepare.so
+vendor/lib64/libSnpeHtpV68Stub.so
+vendor/lib64/libSnpeHtpV69Stub.so
+vendor/lib64/libTrueSight.so
+vendor/lib64/libaidenoiser.so
+vendor/lib64/libaidenoiserv2.so
+vendor/lib64/libanc_single_bokeh.so
+vendor/lib64/libanc_single_rt_bokeh.so
+vendor/lib64/libbitmlengine.so
+vendor/lib64/libbitmlenginev2.so
+vendor/lib64/libc++_shared.so
+vendor/lib64/libcalculator.so;FIX_SONAME
+vendor/lib64/libcalculator_htp.so;FIX_SONAME
+vendor/lib64/libcamera_scene.so
+vendor/lib64/libcamerapostproc.so
+vendor/lib64/libcamxexternalformatutils.so
+vendor/lib64/libcamxfdengine.so
+vendor/lib64/libcamxifestriping.so
+vendor/lib64/libcamximageformatutils.so
+vendor/lib64/libcamxqsatalgo.so
+vendor/lib64/libcamxstatscore.so
+vendor/lib64/libcamxswispiqmodule.so
+vendor/lib64/libcamxswprocessalgo.so
+vendor/lib64/libcamxtintlessalgo.so
+vendor/lib64/libchilog.so
+vendor/lib64/libcom.qti.chinodeutils.so
+vendor/lib64/libcom.xiaomi.metadatautils.so
+vendor/lib64/libcom.xiaomi.pluginutils.so
+vendor/lib64/libipebpsstriping.so
+vendor/lib64/libipebpsstriping170.so
+vendor/lib64/libjpege.so
+vendor/lib64/libmctfengine_stub.so
+vendor/lib64/libmfec.so
+vendor/lib64/libmialgo_ai_vision.so
+vendor/lib64/libmialgo_sd.so
+vendor/lib64/libmialgo_utils.so
+vendor/lib64/libmialgoengine.so
+vendor/lib64/libmialgoengine2.so
+vendor/lib64/libmmcamera_bestats.so
+vendor/lib64/libmmcamera_cac3.so
+vendor/lib64/libmmcamera_lscv35.so
+vendor/lib64/libmmcamera_mfnr.so
+vendor/lib64/libmmcamera_mfnr_t4.so
+vendor/lib64/libmmcamera_pdpc.so
+vendor/lib64/libmpbase.so
+vendor/lib64/libopencv.so
+vendor/lib64/libopestriping.so
+vendor/lib64/libqll10.so
+vendor/lib64/libqllengine.so
+vendor/lib64/libswregistrationalgo.so
+vendor/lib64/libtfestriping.so
+vendor/lib64/vendor.qti.hardware.camera.postproc@1.0-service-impl.so
+system_ext/lib64/libcameraopt.so
+vendor/lib64/libofflinelog.so
+vendor/lib64/libofflinedump.so
+vendor/lib64/libanc_night.so
+vendor/lib64/libmorpho_ImageRefiner.so
+vendor/lib64/libgf_ca.so
+vendor/lib64/libseclog.so
+vendor/lib64/libanc_single_bokeh_rear.so
+vendor/lib64/libmorpho_HdrChecker.so
+vendor/lib64/libcamxfdalgo.so
+vendor/lib64/libcamxfacialfeatures.so
+vendor/lib64/libtflite_fd.so
+vendor/lib64/vendor.qti.memory.pasrmanager@1.0.so
+vendor/lib64/vendor.qti.memory.pasrmanager@1.1.so
+vendor/lib64/libcamera_nn_stub.so
+system_ext/lib64/vendor.qti.qesdhalaidl-V2-ndk.so
+vendor/lib64/libos.so
+vendor/lib64/libsynx.so
+vendor/lib64/libthreadutils.so
+vendor/lib64/vendor.xiaomi.hardware.seccam-V1-ndk.so
+system_ext/lib64/vendor.xiaomi.hardware.quickcamera-V1-ndk.so
+
+# Firmware
+odm/firmware/Conf_MultipleTest.ini
+odm/firmware/focaltech_ts_fw_hkc.bin
+odm/firmware/novatek_ts_fw_boe.bin
+odm/firmware/novatek_ts_fw_txd.bin
+odm/firmware/novatek_ts_fw_xinli.bin
+odm/firmware/novatek_ts_mp_boe.bin
+odm/firmware/novatek_ts_mp_txd.bin
+odm/firmware/novatek_ts_mp_xinli.bin
+vendor/firmware/a610_zap.b00
+vendor/firmware/a610_zap.b01
+vendor/firmware/a610_zap.b02
+vendor/firmware/a610_zap.mbn
+vendor/firmware/a610_zap.mdt
+vendor/firmware/a630_sqe.fw
+vendor/firmware/gen70900_aqe.fw
+vendor/firmware/gen70900_sqe.fw
+vendor/firmware/gen70900_zap.mbn
+vendor/firmware/gen71100_gmu.bin
+vendor/firmware/gen71100_sqe.fw
+vendor/firmware/gen71100_zap.mbn
+vendor/firmware/gmu_gen70900.bin
+vendor/firmware/sipa.bin
+vendor/firmware/venus.mbn
+vendor/firmware/venus_4mb.mbn
+vendor/firmware/venus_4mb_ecdsa.mbn
+vendor/firmware/venus_4mb_unsigned.mbn
+vendor/firmware/venus_4mb_v6.mbn
+vendor/firmware/venus_4mb_v6_rsa.mbn
+vendor/firmware/venus_4mb_v7.mbn
+vendor/firmware/venus_5mb.mbn
+vendor/firmware/venus_5mb_ecdsa.mbn
+vendor/firmware/venus_5mb_unsigned.mbn
+vendor/firmware/venus_5mb_v6.mbn
+vendor/firmware/venus_5mb_v6_rsa.mbn
+vendor/firmware/venus_5mb_v7.mbn
+vendor/firmware/venus_ecdsa.mbn
+vendor/firmware/venus_unsigned.mbn
+vendor/firmware/venus_v6.mbn
+vendor/firmware/venus_v6_rsa.mbn
+vendor/firmware/venus_v7.mbn
+vendor/firmware/vpu20_1v.mbn
+vendor/firmware/vpu20_1v_unsigned.mbn
+vendor/firmware/vpu20_4v.mbn
+vendor/firmware/vpu20_4v_unsigned.mbn
+
+# Configstore
+vendor/bin/hw/vendor.qti.hardware.capabilityconfigstore@1.0-service
+vendor/etc/init/vendor.qti.hardware.capabilityconfigstore@1.0-service.rc
+vendor/lib64/hw/vendor.qti.hardware.capabilityconfigstore@1.0-impl.so
+
+# DPM
+vendor/bin/dpmQmiMgr
+vendor/bin/vendor.dpmd
+vendor/etc/dpm_vndr/vendor.dpm.conf
+vendor/etc/init/dpmQmiMgr.rc
+vendor/etc/init/vendor.dpmd.rc
+vendor/etc/vintf/manifest/dpm-saidl.xml
+vendor/lib64/com.qualcomm.qti.dpm.api@1.0.so
+vendor/lib64/libdpmqmihal.so
+vendor/lib64/vendor.libdpmctmgr.so
+vendor/lib64/vendor.libdpmfdmgr.so
+vendor/lib64/vendor.libdpmframework.so
+vendor/lib64/vendor.libdpmtcm.so
+vendor/lib64/vendor.libmwqemiptablemgr.so
+vendor/lib64/vendor.qti.hardware.dpmaidlservice-V1-ndk.so
+vendor/lib64/vendor.qti.hardware.dpmservice@1.0.so
+vendor/lib64/vendor.qti.hardware.dpmservice@1.1.so
+
+# DRM
+vendor/bin/hw/vendor.qti.hardware.qseecom@1.0-service
+vendor/bin/qseecom_sample_client
+vendor/bin/qseecomd
+vendor/bin/ssgqmigd64
+vendor/etc/gpfspath_oem_config.xml
+vendor/etc/init/qseecomd.rc
+vendor/etc/init/vendor.qti.hardware.qseecom@1.0-service.rc
+vendor/etc/vintf/manifest/vendor.qti.hardware.qseecom@1.0-service.xml
+vendor/lib64/hw/vendor.qti.hardware.qseecom@1.0-impl.so
+vendor/lib64/libGPreqcancel.so
+vendor/lib64/libGPreqcancel_svc.so
+vendor/lib64/libQSEEComAPI.so
+vendor/lib64/libbase64.so
+vendor/lib64/libcpion.so
+vendor/lib64/libdrmfs.so
+vendor/lib64/libdrmtime.so
+vendor/lib64/libdrmutils.so
+vendor/lib64/libgpt.so
+vendor/lib64/libops.so
+vendor/lib64/libqisl.so
+vendor/lib64/librpmb.so
+vendor/lib64/libssd.so
+vendor/lib64/vendor.qti.hardware.qseecom-V1-ndk.so
+vendor/lib64/vendor.qti.hardware.qseecom@1.0.so
+
+# DRM Widevine
+odm/lib64/libwvkeybox.so
+vendor/apex/com.google.android.widevine.nonupdatable.apex
+vendor/lib64/liboemcrypto.so
+vendor/lib64/libtrustedapploader.so
+
+# DSP
+vendor/bin/dspservice
+vendor/etc/init/vendor.qti.hardware.dsp@1.0-service.rc
+vendor/etc/seccomp_policy/vendor.qti.hardware.dsp.policy
+vendor/lib64/vendor.qti.hardware.dsp@1.0.so
+
+# Diag
+system_ext/lib64/libdiag_system.so
+system_ext/lib64/vendor.qti.diaghal@1.0.so
+vendor/bin/diag-router
+vendor/etc/init/vendor.qti.diag.rc
+vendor/etc/vintf/manifest/vendor.qti.diag.hal.service.xml
+vendor/lib64/libdiagjni.so
+vendor/lib64/vendor.qti.diaghal@1.0.so;MODULE_SUFFIX=_vendor
+
+# Display (Configs)
+vendor/etc/display/DPU1010.xml
+vendor/etc/display/DPU1020.xml
+vendor/etc/display/DPU10__.xml
+vendor/etc/display/DPU870.xml
+vendor/etc/display/DPU9__.xml
+
+# Display (HDR)
+vendor/lib64/libhdr_stub.so
+vendor/lib64/libgame_enhance.so
+vendor/lib64/libhdr_backlight_adapter.so
+vendor/lib64/libhdr_tm.so
+
+# Display (HWC)
+vendor/bin/hw/vendor.qti.hardware.display.allocator-service
+vendor/bin/hw/vendor.qti.hardware.display.composer-service;DISABLE_DEPS
+vendor/bin/hw/vendor.qti.hardware.display.demura-service
+vendor/bin/qdcmss
+vendor/etc/init/qdcmss.rc
+vendor/etc/init/vendor.qti.hardware.display.allocator-service.rc
+vendor/etc/init/vendor.qti.hardware.display.composer-service.rc
+vendor/etc/init/vendor.qti.hardware.display.demura-service.rc
+vendor/etc/snapdragon_color_libs_config.xml
+vendor/etc/vintf/manifest/android.hardware.graphics.mapper-impl-qti-display.xml
+vendor/etc/vintf/manifest/vendor.qti.hardware.display.allocator-service.xml
+vendor/etc/vintf/manifest/vendor.qti.hardware.display.composer-service.xml:vendor/etc/vintf/manifest/vendor.qti.hardware.display.composer-service_warm.xml
+vendor/etc/vintf/manifest/vendor.qti.hardware.display.demura-service.xml
+vendor/lib64/hw/gralloc.default.so
+vendor/lib64/libbacklight-calib.so
+vendor/lib64/libdfintf.so
+vendor/lib64/libdigital-dimming.so
+vendor/lib64/libdisplayconfig.qti.so
+vendor/lib64/libdisplaydebug.so;DISABLE_DEPS
+vendor/lib64/libdpp_manager.so
+vendor/lib64/libdpps.so
+vendor/lib64/libfeutils.so
+vendor/lib64/libfilefinder.so
+vendor/lib64/libgpu_tonemapper.so
+vendor/lib64/libgralloc.qti.so
+vendor/lib64/libgralloccore.so
+vendor/lib64/libgrallocutils.so
+vendor/lib64/libhistogram.so
+vendor/lib64/libmemutils.so
+vendor/lib64/libqdcm-algo.so
+vendor/lib64/libqdcm-json-mode-parser.so
+vendor/lib64/libqdcm-mode-parser.so
+vendor/lib64/libqdutils.so
+vendor/lib64/libqservice.so
+vendor/lib64/libsdmcore.so
+vendor/lib64/libsdmdal.so
+vendor/lib64/libsdmutils.so
+vendor/lib64/libsnapdragoncolor-manager.so
+vendor/lib64/libsnapdragoncolor-qdcm.so
+vendor/lib64/vendor.qti.hardware.qdutils_disp@1.0.so
+system_ext/lib64/vendor.xiaomi.hardware.display.mihwcextension-V1-ndk.so
+
+# Display (SDM)
+vendor/etc/clstc_config_library.xml
+vendor/etc/display/advanced_sf_offsets.xml
+vendor/etc/display/thermallevel_to_fps.xml
+vendor/lib64/libclstc_algorithm_adapter.so
+vendor/lib64/libclstc_gcp_adapter.so
+vendor/lib64/libclstc_tm.so
+vendor/lib64/libdisplayqos.so
+vendor/lib64/libdisplayskuutils.so
+vendor/lib64/libintervmipc.so
+vendor/lib64/libqrtrclient.so
+vendor/lib64/libqseed3.so
+vendor/lib64/librcmask.so
+vendor/lib64/libsdedrm.so
+vendor/lib64/libsdm-color.so
+vendor/lib64/libsdm-colormgr-algo.so
+vendor/lib64/libsdm-disp-vndapis.so
+vendor/lib64/libsdmextension.so
+vendor/lib64/libtestutils.so
+vendor/lib64/libtinyxml2_1.so
+vendor/lib64/libvmfilexfer.so
+
+# Display (Postprocessing)
+vendor/bin/hw/vendor.qti.hardware.display.color-service
+vendor/bin/ppd
+vendor/etc/init/vendor.qti.hardware.display.color-service.rc
+vendor/lib64/libdisp-aba.so
+vendor/lib64/vendor.display.color@1.0.so
+vendor/lib64/vendor.display.color@1.1.so
+vendor/lib64/vendor.display.color@1.2.so
+vendor/lib64/vendor.display.color@1.3.so
+vendor/lib64/vendor.display.color@1.4.so
+vendor/lib64/vendor.display.color@1.5.so
+vendor/lib64/vendor.display.postproc@1.0.so
+
+# Display Calibration
+odm/etc/display/qdcm_calib_data_c3f2_35_02_0d_video_mode_hd_dsi_panel.json
+odm/etc/display/qdcm_calib_data_c3f2_37_02_0b_video_mode_hd_dsi_panel.json
+odm/etc/display/qdcm_calib_data_c3f2_43_02_0a_video_mode_hd_dsi_panel.json
+odm/etc/display/qdcm_calib_data_c3f2_46_03_0c_video_mode_hd_dsi_panel.json
+odm/etc/mdss_dsi_panel_c3f2_35_02_0d_hd_video_mi.xml
+odm/etc/mdss_dsi_panel_c3f2_37_02_0b_hd_video_mi.xml
+odm/etc/mdss_dsi_panel_c3f2_43_02_0a_hd_video_mi.xml
+odm/etc/mdss_dsi_panel_c3f2_46_03_0c_hd_video_mi.xml
+vendor/etc/display/qdcm_calib_data_Sharp_2k_cmd_mode_qsync_dsi_panel.json
+vendor/etc/display/qdcm_calib_data_Sharp_2k_video_mode_qsync_dsi_panel.json
+vendor/etc/display/qdcm_calib_data_Sharp_4k_cmd_mode_dsc_dsi_panel.json
+vendor/etc/display/qdcm_calib_data_Sharp_4k_video_mode_dsc_dsi_panel.json
+vendor/etc/display/qdcm_calib_data_Sharp_qhd_cmd_mode_dsi_panel.json
+vendor/etc/display/qdcm_calib_data_Sharp_qhd_video_mode_dsi_panel.json
+vendor/etc/display/qdcm_calib_data_ft8726_lcd_video_mode_dsi_focaltech_panel_with_DSC.json
+vendor/etc/display/qdcm_calib_data_nt36672e_lcd_video_mode_dsi_novatek_panel_with_DSC.json
+vendor/etc/display/qdcm_calib_data_nt36672e_lcd_video_mode_dsi_novatek_panel_without_DSC.json
+vendor/etc/display/qdcm_calib_data_r66451_amoled_cmd_mode_dsi_visionox_panel_with_DSC.json
+vendor/etc/display/qdcm_calib_data_r66451_amoled_cmd_mode_dsi_visionox_panel_without_DSC.json
+vendor/etc/display/qdcm_calib_data_r66451_amoled_video_mode_dsi_visionox_panel_with_DSC.json
+vendor/etc/display/qdcm_calib_data_r66451_amoled_video_mode_dsi_visionox_panel_without_DSC.json
+vendor/etc/display/qdcm_calib_data_sharp_1080p_cmd_mode_dsi_panel.json
+vendor/etc/display/qdcm_calib_data_vtdr6130_amoled_cmd_mode_dsi_visionox_panel_with_DSC.json
+vendor/etc/display/qdcm_calib_data_vtdr6130_amoled_video_mode_dsi_visionox_panel_with_DSC.json
+
+# Displayfeature
+odm/lib64/hw/displayfeature.default.so
+odm/lib64/libMiDispDevManager.so
+odm/lib64/libadaptivehdr.so
+odm/lib64/libcolortempmode.so
+odm/lib64/libdisplaycount.so
+odm/lib64/libdisplaylog.so
+odm/lib64/libdither.so
+odm/lib64/libeyecare.so
+odm/lib64/libflatmode.so
+odm/lib64/libfpsmonitor.so
+odm/lib64/libhistprocess.so
+odm/lib64/libmi-stc-HW-modulate.so
+odm/lib64/libmiBrightness.so
+odm/lib64/libmiClstc.so
+odm/lib64/libmiSensorCtrl.so
+odm/lib64/libmiXmlParser.so
+odm/lib64/libmi_dspp.so
+odm/lib64/libmieventnodewatch.so
+odm/lib64/libpaperMode.so
+odm/lib64/librhytheyecare.so
+odm/lib64/libsdr2hdr.so
+odm/lib64/libsre.so
+odm/lib64/libtruetone.so
+odm/lib64/libvideomode.so
+vendor/bin/displayfeature
+vendor/bin/hw/vendor.xiaomi.hardware.displayfeature_aidl-service
+vendor/etc/init/vendor.xiaomi.hardware.displayfeature_aidl-service.rc
+vendor/etc/vintf/manifest/vendor.xiaomi.hardware.displayfeature_aidl-service.xml
+vendor/lib64/hw/android.hardware.graphics.mapper@4.0-impl-qti-display.so
+vendor/lib64/libdisplayfeature.so
+vendor/lib64/libdisplayfeatureservice.so
+vendor/lib64/libqdMetaData.so
+vendor/lib64/vendor.xiaomi.hardware.displayfeature_aidl-V2-ndk.so
+
+# Displayfeature (Configs)
+odm/etc/df_default.xml
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/ClstcLut0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/ClstcLut1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/ClstcLut2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/ClstcLut3.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/ClstcLut4.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/ClstcLut5.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/ClstcLut6.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/ClstcLut7.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/ClstcLutInfo.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/PicHDRLchIn.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/clstc_gc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/clstc/clstc_igc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/cct_pcc.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLutInfo.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_10.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_11.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_12.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_13.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_14.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_15.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_16.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_17.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_18.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_19.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_20.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_3.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_4.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_5.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_6.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_7.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_8.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/miLut_9.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/mi_gc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/mi_gc_1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/mi_gc_2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_35_02_0d_hd_video/mi_gc_3.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/ClstcLut0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/ClstcLut1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/ClstcLut2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/ClstcLut3.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/ClstcLut4.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/ClstcLut5.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/ClstcLut6.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/ClstcLut7.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/ClstcLutInfo.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/PicHDRLchIn.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/clstc_gc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/clstc/clstc_igc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/cct_pcc.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLutInfo.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_10.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_11.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_12.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_13.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_14.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_15.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_16.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_17.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_18.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_19.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_20.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_3.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_4.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_5.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_6.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_7.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_8.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/miLut_9.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/mi_gc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/mi_gc_1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/mi_gc_2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_37_02_0b_hd_video/mi_gc_3.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/ClstcLut0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/ClstcLut1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/ClstcLut2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/ClstcLut3.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/ClstcLut4.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/ClstcLut5.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/ClstcLut6.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/ClstcLut7.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/ClstcLutInfo.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/PicHDRLchIn.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/clstc_gc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/clstc/clstc_igc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/cct_pcc.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLutInfo.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_10.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_11.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_12.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_13.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_14.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_15.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_16.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_17.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_18.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_19.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_20.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_3.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_4.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_5.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_6.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_7.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_8.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/miLut_9.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/mi_gc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/mi_gc_1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/mi_gc_2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_43_02_0a_hd_video/mi_gc_3.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/ClstcLut0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/ClstcLut1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/ClstcLut2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/ClstcLut3.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/ClstcLut4.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/ClstcLut5.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/ClstcLut6.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/ClstcLut7.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/ClstcLutInfo.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/PicHDRLchIn.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/clstc_gc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/clstc/clstc_igc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/cct_pcc.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLutInfo.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_10.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_11.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_12.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_13.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_14.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_15.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_16.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_17.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_18.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_19.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_20.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_3.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_4.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_5.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_6.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_7.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_8.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/miLut_9.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/mi_gc_0.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/mi_gc_1.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/mi_gc_2.txt
+odm/etc/disp0/mdss_dsi_panel_c3f2_46_03_0c_hd_video/mi_gc_3.txt
+
+# Fingerprint
+vendor/lib64/libgf_hal.so
+vendor/lib64/vendor.xiaomi.hardware.fx.tunnel-V1-ndk.so
+
+# GNSS
+vendor/bin/hw/android.hardware.gnss-aidl-service-qti
+vendor/etc/init/android.hardware.gnss-aidl-service-qti.rc
+vendor/etc/izat.conf
+vendor/etc/vintf/manifest/android.hardware.gnss-aidl-service-qti.xml
+vendor/etc/vintf/manifest/vendor.qti.gnss-service.xml
+vendor/lib64/hw/android.hardware.gnss-aidl-impl-qti.so
+vendor/lib64/vendor.qti.gnss-service.so
+vendor/app/CACertService/CACertService.apk
+vendor/bin/edgnss-daemon
+vendor/bin/engine-service
+vendor/bin/loc_launcher
+vendor/bin/lowi-server
+vendor/bin/mlid
+vendor/bin/slim_daemon
+vendor/bin/xtra-daemon
+vendor/bin/xtwifi-client
+vendor/etc/apdr.conf
+vendor/etc/batching.conf
+vendor/etc/gps.conf
+vendor/etc/gps_diag.cfg
+vendor/etc/init/loc-launcher.rc
+vendor/etc/lowi.conf
+vendor/etc/sap.conf
+vendor/etc/seccomp_policy/gnss@2.0-base.policy
+vendor/etc/seccomp_policy/gnss@2.0-edgnss-daemon.policy
+vendor/etc/seccomp_policy/gnss@2.0-qsap-location.policy
+vendor/etc/seccomp_policy/gnss@2.0-xtra-daemon.policy
+vendor/etc/seccomp_policy/gnss@2.0-xtwifi-client.policy
+vendor/etc/xtwifi.conf
+vendor/lib64/libbatching.so
+vendor/lib64/libcacertclient.so
+vendor/lib64/libcdfw.so
+vendor/lib64/libcdfw_remote_api.so
+vendor/lib64/libdataitems.so
+vendor/lib64/libengineplugin.so
+vendor/lib64/libgdtap.so
+vendor/lib64/libgeofencing.so
+vendor/lib64/libgnss.so
+vendor/lib64/libgnsspps.so
+vendor/lib64/libgps.utils.so
+vendor/lib64/libizat_client_api.so
+vendor/lib64/libizat_core.so
+vendor/lib64/libjnihelper.so
+vendor/lib64/liblbs_core.so
+vendor/lib64/libloc_api_v02.so
+vendor/lib64/libloc_api_wds.so
+vendor/lib64/libloc_base_util.so
+vendor/lib64/libloc_core.so
+vendor/lib64/libloc_eng_hub.so
+vendor/lib64/libloc_mq_client.so
+vendor/lib64/libloc_qwes_iface.so
+vendor/lib64/libloc_socket.so
+vendor/lib64/libloc_util.so
+vendor/lib64/liblocation_api.so
+vendor/lib64/liblocation_api_msg.so
+vendor/lib64/liblocation_client_api.so
+vendor/lib64/liblocation_integration_api.so
+vendor/lib64/liblocationservice.so
+vendor/lib64/liblocationservice_glue.so
+vendor/lib64/liblocdiagiface.so
+vendor/lib64/liblowi_client.so
+vendor/lib64/liblowi_common.so
+vendor/lib64/liblowi_wifihal.so
+vendor/lib64/libmapdata_api.so
+vendor/lib64/libqsh.so
+vendor/lib64/libslimclient.so
+vendor/lib64/libsynergy_loc_api.so
+vendor/lib64/libsys_info_cache.so
+vendor/lib64/libwifiobserver.so
+vendor/lib64/libxtadapter.so
+vendor/lib64/vendor.qti.gnss-V6-ndk.so
+
+# Gatekeeper
+vendor/bin/hw/android.hardware.gatekeeper-service-qti
+vendor/etc/init/android.hardware.gatekeeper-service-qti.rc
+vendor/lib64/hw/libqtigatekeeper.so
+
+# Graphics
+vendor/lib64/egl/eglSubDriverAndroid.so
+vendor/lib64/egl/libEGL_adreno.so;SYMLINK=vendor/lib64/libEGL_adreno.so
+vendor/lib64/egl/libGLESv1_CM_adreno.so
+vendor/lib64/egl/libGLESv2_adreno.so;SYMLINK=vendor/lib64/libGLESv2_adreno.so
+vendor/lib64/egl/libq3dtools_adreno.so;SYMLINK=vendor/lib64/libq3dtools_adreno.so
+vendor/lib64/egl/libq3dtools_esx.so
+vendor/lib64/hw/vulkan.adreno.so
+vendor/lib64/libCB.so
+vendor/lib64/libOpenCL.so
+vendor/lib64/libOpenCL_adreno.so
+vendor/lib64/libadreno_app_profiles.so
+vendor/lib64/libadreno_utils.so
+vendor/lib64/libgsl.so
+vendor/lib64/libkernelmanager.so
+vendor/lib64/libllvm-glnext.so
+vendor/lib64/libllvm-qcom.so
+vendor/lib64/libllvm-qgl.so
+
+# HDCP
+vendor/lib64/libhdcpsrm.so
+vendor/lib64/libmm-hdcpmgr.so
+
+# Hotword enrollment
+product/etc/permissions/privapp-permissions-google-audio-system.xml:product/etc/permissions/privapp-permissions-hotword.xml
+product/priv-app/HotwordEnrollmentOKGoogleHEXAGON_WIDEBAND/HotwordEnrollmentOKGoogleHEXAGON_WIDEBAND.apk
+product/priv-app/HotwordEnrollmentXGoogleHEXAGON_WIDEBAND/HotwordEnrollmentXGoogleHEXAGON_WIDEBAND.apk
+system_ext/etc/permissions/com.android.hotwordenrollment.common.util.xml
+system_ext/framework/com.android.hotwordenrollment.common.util.jar
+
+# Kernel
+vendor/bin/init.qti.write.sh
+vendor/bin/system_dlkm_modprobe.sh
+vendor/bin/vendor_modprobe.sh
+vendor/etc/init/hw/init.qti.kernel.rc
+
+# Keymaster
+vendor/bin/hw/android.hardware.keymaster@4.0-service-qti
+vendor/lib64/libkeymasterdeviceutils.so
+vendor/lib64/libkeymasterprovision.so
+vendor/lib64/libkeymasterutils.so
+vendor/lib64/libqcbor.so
+vendor/lib64/libqtikeymaster4.so
+
+# Keymint
+vendor/bin/hw/android.hardware.security.keymint-service-qti
+vendor/etc/init/android.hardware.security.keymint-service-qti.rc
+vendor/etc/vintf/manifest/android.hardware.security.keymint-service-qti-rkp.xml
+vendor/lib64/libqtikeymint.so
