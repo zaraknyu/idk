@@ -2,7 +2,7 @@
 
 # Repo Init
 repo init -u https://github.com/LineageOS/android.git -b lineage-23.0 --git-lfs
-/opt/crave/resync.sh
+repo sync -c -j$(nproc --all) --force-sync --no-tags --no-clone-bundle --prune
 
 # Removing used directories
 rm -rf device/xiaomi/warm
