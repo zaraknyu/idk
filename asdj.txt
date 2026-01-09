@@ -66,5 +66,3 @@ C:\Users\delac>adb -P 5058 shell dmesg | findstr "avc: denied"
 [   22.169839] type=1400 audit(8338489.571:56): avc:  denied  { read } for  comm="vendor.qti.medi" name="u:object_r:custom_version_prop:s0" dev="tmpfs" ino=199 scontext=u:r:mediacodec:s0 tcontext=u:object_r:custom_version_prop:s0 tclass=file permissive=0
 [   22.255186] type=1400 audit(8338489.659:57): avc:  denied  { read } for  comm="HwBinder:2920_2" name="u:object_r:custom_version_prop:s0" dev="tmpfs" ino=199 scontext=u:r:mediacodec:s0 tcontext=u:object_r:custom_version_prop:s0 tclass=file permissive=0
 [   27.310683] type=1400 audit(8338494.711:58): avc:  denied  { read } for  comm="HwBinder:2977_2" name="u:object_r:custom_version_prop:s0" dev="tmpfs" ino=199 scontext=u:r:mediacodec:s0 tcontext=u:object_r:custom_version_prop:s0 tclass=file permissive=0
-
-C:\Users\delac>
