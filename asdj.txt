@@ -54,7 +54,6 @@ C:\Users\delac>adb -P 5058 logcat -d -b all | findstr /i avc
 04-07 10:57:43.068  1786  1786 I auditd  : type=1400 audit(0.0:55): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
 04-07 10:58:01.420  1449  1449 I auditd  : type=1400 audit(0.0:56): avc:  denied  { read write } for  comm="android.hardwar" name="xiaomi-touch" dev="tmpfs" ino=1862 scontext=u:r:hal_power_default:s0 tcontext=u:object_r:touchfeature_device:s0 tclass=chr_file permissive=0
 01-09 20:54:13.503  1449  1449 I auditd  : type=1400 audit(0.0:57): avc:  denied  { read write } for  comm="android.hardwar" name="xiaomi-touch" dev="tmpfs" ino=1862 scontext=u:r:hal_power_default:s0 tcontext=u:object_r:touchfeature_device:s0 tclass=chr_file permissive=0
-01-09 20:54:13.503  1449  1449 W android.hardwar: type=1400 audit(0.0:57): avc:  denied  { read write } for  name="xiaomi-touch" dev="tmpfs" ino=1862 scontext=u:r:hal_power_default:s0 tcontext=u:object_r:touchfeature_device:s0 tclass=chr_file permissive=0
 01-09 20:54:23.973  1535  1757 I QC2CompStore: Created interface(c2.qti.avc.decoder) id(26)
 01-09 20:54:23.974  3590  3617 I Codec2InfoBuilder: adding type 'video/avc'
 01-09 20:54:23.980  1535  1535 I QC2CompStore: Created interface(c2.qti.avc.decoder.low_latency) id(27)
@@ -70,5 +69,7 @@ C:\Users\delac>adb -P 5058 logcat -d -b all | findstr /i avc
 01-09 20:54:24.160  1536  2873 E QC2AudioCompStore: Failed to locate interface with name c2.android.avc.encoder
 01-09 20:54:24.164  3590  3617 I Codec2InfoBuilder: adding type 'video/avc'
 01-09 20:54:24.165  1910  2876 D C2SoftAvcEnc: Given level 0 does not cover current configuration: adjusting to 5000
+01-09 20:54:48.883  1449  1449 I auditd  : type=1400 audit(0.0:58): avc:  denied  { read write } for  comm="android.hardwar" name="xiaomi-touch" dev="tmpfs" ino=1862 scontext=u:r:hal_power_default:s0 tcontext=u:object_r:touchfeature_device:s0 tclass=chr_file permissive=0
+01-09 20:54:48.883  1449  1449 W android.hardwar: type=1400 audit(0.0:58): avc:  denied  { read write } for  name="xiaomi-touch" dev="tmpfs" ino=1862 scontext=u:r:hal_power_default:s0 tcontext=u:object_r:touchfeature_device:s0 tclass=chr_file permissive=0
 
 C:\Users\delac>
