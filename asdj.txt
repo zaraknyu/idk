@@ -1,35 +1,70 @@
-C:\Users\delac>adb -P 5058 logcat -d all | findstr /i avc
-04-07 12:01:12.695  1523  1523 I msm_vidc: err : e9814fc0:  avcE_0: msm_vidc_query_ctrl: get_ctrl failed for id 10029696
-04-07 12:01:25.639  1526  1526 W vendor.qti.medi: type=1400 audit(0.0:54): avc:  denied  { read } for  name="u:object_r:custom_version_prop:s0" dev="tmpfs" ino=199 scontext=u:r:mediacodec:s0 tcontext=u:object_r:custom_version_prop:s0 tclass=file permissive=0
-04-07 12:01:26.037  1523  1523 I QC2CompStore: Created interface(c2.qti.avc.decoder) id(0)
-04-07 12:01:26.037  1808  2186 I Codec2InfoBuilder: adding type 'video/avc'
-04-07 12:01:26.042  1523  1731 I QC2CompStore: Created interface(c2.qti.avc.decoder.low_latency) id(1)
-04-07 12:01:26.042  1808  2186 I Codec2InfoBuilder: adding type 'video/avc'
-04-07 12:01:26.045  1523  1730 I QC2CompStore: Created interface(c2.qti.avc.decoder.secure) id(2)
-04-07 12:01:26.046  1808  2186 I Codec2InfoBuilder: adding type 'video/avc'
-04-07 12:01:26.063  1523  1731 I QC2CompStore: Created interface(c2.qti.avc.encoder) id(9)
-04-07 12:01:26.063  1808  2186 I Codec2InfoBuilder: adding type 'video/avc'
-04-07 12:01:26.136  1523  1523 E QC2CompStore: Failed to locate interface with name c2.android.avc.decoder
-04-07 12:01:26.136  2862  2870 E QC2AudioCompStore: Failed to locate interface with name c2.android.avc.decoder
-04-07 12:01:26.139  1808  2186 I Codec2InfoBuilder: adding type 'video/avc'
-04-07 12:01:26.142  1523  1523 E QC2CompStore: Failed to locate interface with name c2.android.avc.encoder
-04-07 12:01:26.142  2862  2870 E QC2AudioCompStore: Failed to locate interface with name c2.android.avc.encoder
-04-07 12:01:26.146  1808  2186 I Codec2InfoBuilder: adding type 'video/avc'
-04-07 12:01:26.146  1882  2138 D C2SoftAvcEnc: Given level 0 does not cover current configuration: adjusting to 5000
-01-09 20:53:48.246  1523  1523 I QC2CompStore: Created interface(c2.qti.avc.decoder) id(13)
-01-09 20:53:48.247  3197  3223 I Codec2InfoBuilder: adding type 'video/avc'
-01-09 20:53:48.253  1523  1730 I QC2CompStore: Created interface(c2.qti.avc.decoder.low_latency) id(14)
-01-09 20:53:48.253  3197  3223 I Codec2InfoBuilder: adding type 'video/avc'
-01-09 20:53:48.256  1523  1731 I QC2CompStore: Created interface(c2.qti.avc.decoder.secure) id(15)
-01-09 20:53:48.256  3197  3223 I Codec2InfoBuilder: adding type 'video/avc'
-01-09 20:53:48.275  1523  2880 I QC2CompStore: Created interface(c2.qti.avc.encoder) id(22)
-01-09 20:53:48.275  3197  3223 I Codec2InfoBuilder: adding type 'video/avc'
-01-09 20:53:48.351  1523  1730 E QC2CompStore: Failed to locate interface with name c2.android.avc.decoder
-01-09 20:53:48.351  2862  2870 E QC2AudioCompStore: Failed to locate interface with name c2.android.avc.decoder
-01-09 20:53:48.354  3197  3223 I Codec2InfoBuilder: adding type 'video/avc'
-01-09 20:53:48.356  1523  1730 E QC2CompStore: Failed to locate interface with name c2.android.avc.encoder
-01-09 20:53:48.356  2862  2870 E QC2AudioCompStore: Failed to locate interface with name c2.android.avc.encoder
-01-09 20:53:48.360  3197  3223 I Codec2InfoBuilder: adding type 'video/avc'
-01-09 20:53:48.360  1882  2137 D C2SoftAvcEnc: Given level 0 does not cover current configuration: adjusting to 5000
+C:\Users\delac>adb -P 5058 shell dmesg | findstr "avc: denied"
+[    1.905689] audit: type=1107 audit(8338470.711:4): pid=1 uid=0 auid=4294967295 ses=4294967295 subj=u:r:init:s0 msg='avc:  denied  { set } for property=persist.backup.ntpServer pid=1 uid=0 gid=0 scontext=u:r:vendor_init:s0 tcontext=u:object_r:default_prop:s0 tclass=property_service permissive=0'
+[    1.907456] audit: type=1107 audit(8338470.715:5): pid=1 uid=0 auid=4294967295 ses=4294967295 subj=u:r:init:s0 msg='avc:  denied  { set } for property=ro.product.vendor_dlkm.cert pid=1 uid=0 gid=0 scontext=u:r:vendor_init:s0 tcontext=u:object_r:default_prop:s0 tclass=property_service permissive=0'
+[    1.907519] audit: type=1107 audit(8338470.715:6): pid=1 uid=0 auid=4294967295 ses=4294967295 subj=u:r:init:s0 msg='avc:  denied  { set } for property=ro.product.vendor_dlkm.marketname pid=1 uid=0 gid=0 scontext=u:r:vendor_init:s0 tcontext=u:object_r:default_prop:s0 tclass=property_service permissive=0'
+[    1.948482] audit: type=1107 audit(8338470.755:7): pid=1 uid=0 auid=4294967295 ses=4294967295 subj=u:r:init:s0 msg='avc:  denied  { read } for property=persist.dbg.keep_debugfs_mounted pid=0 uid=0 gid=0 scontext=u:r:vendor_init:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0'
+[    2.793530] audit: type=1400 audit(8338471.599:8): avc:  denied  { net_bind_service } for  pid=448 comm="krfcommd" capability=10  scontext=u:r:kernel:s0 tcontext=u:r:kernel:s0 tclass=capability permissive=0
+[    2.865249] init: Command 'write /dev/blkio/blkio.weight 1000' action=init (/system/etc/init/hw/init.rc:257) took 0ms and failed: Unable to write to file '/dev/blkio/blkio.weight': open() failed: Permission denied
+[    2.865505] init: Command 'write /dev/blkio/background/blkio.weight 200' action=init (/system/etc/init/hw/init.rc:258) took 0ms and failed: Unable to write to file '/dev/blkio/background/blkio.weight': open() failed: Permission denied
+[    2.866006] init: Command 'write /dev/blkio/blkio.group_idle 0' action=init (/system/etc/init/hw/init.rc:260) took 0ms and failed: Unable to write to file '/dev/blkio/blkio.group_idle': open() failed: Permission denied
+[    2.866279] init: Command 'write /dev/blkio/background/blkio.group_idle 0' action=init (/system/etc/init/hw/init.rc:261) took 0ms and failed: Unable to write to file '/dev/blkio/background/blkio.group_idle': open() failed: Permission denied
+[    3.450478] type=1400 audit(8338472.255:9): avc:  denied  { search } for  comm="modprobe" name="block" dev="tmpfs" ino=11 scontext=u:r:vendor_modprobe:s0 tcontext=u:object_r:block_device:s0 tclass=dir permissive=0
+[    4.045992] init: Command 'mount vfat /dev/block/bootdevice/by-name/logfs /dev/logfs noatime umask=006,uid=1000,gid=1000' action=fs (/vendor/etc/init/init.warm.rc:129) took 0ms and failed: mount() failed: Permission denied
+[    4.046025] type=1400 audit(8338472.851:10): avc:  denied  { mounton } for  comm="init" path="/dev/logfs" dev="sde54" ino=1 scontext=u:r:init:s0 tcontext=u:object_r:vfat:s0 tclass=dir permissive=0
+[    4.426169] type=1400 audit(8338473.231:11): avc:  denied  { read write } for  comm="qseecomd" name="0:0:0:0" dev="tmpfs" ino=1561 scontext=u:r:tee:s0 tcontext=u:object_r:device:s0 tclass=chr_file permissive=0
+[    4.426222] type=1400 audit(8338473.231:12): avc:  denied  { read } for  comm="qseecomd" name="sda" dev="tmpfs" ino=1457 scontext=u:r:tee:s0 tcontext=u:object_r:vendor_gpt_block_device:s0 tclass=blk_file permissive=0
+[    4.426246] type=1400 audit(8338473.231:13): avc:  denied  { read write } for  comm="qseecomd" name="0:0:0:2" dev="tmpfs" ino=1565 scontext=u:r:tee:s0 tcontext=u:object_r:device:s0 tclass=chr_file permissive=0
+[    4.426265] type=1400 audit(8338473.231:14): avc:  denied  { read } for  comm="qseecomd" name="sdc" dev="tmpfs" ino=1537 scontext=u:r:tee:s0 tcontext=u:object_r:vendor_xbl_block_device:s0 tclass=blk_file permissive=0
+[    4.427645] type=1400 audit(8338473.235:15): avc:  denied  { read write } for  comm="qseecomd" name="0:0:0:1" dev="tmpfs" ino=1269 scontext=u:r:tee:s0 tcontext=u:object_r:device:s0 tclass=chr_file permissive=0
+[    4.427691] type=1400 audit(8338473.235:16): avc:  denied  { read } for  comm="qseecomd" name="sdb" dev="tmpfs" ino=1309 scontext=u:r:tee:s0 tcontext=u:object_r:vendor_xbl_block_device:s0 tclass=blk_file permissive=0
+[    4.427712] type=1400 audit(8338473.235:17): avc:  denied  { read write } for  comm="qseecomd" name="0:0:0:3" dev="tmpfs" ino=1193 scontext=u:r:tee:s0 tcontext=u:object_r:device:s0 tclass=chr_file permissive=0
+[    4.427730] type=1400 audit(8338473.235:18): avc:  denied  { read } for  comm="qseecomd" name="sdd" dev="tmpfs" ino=1283 scontext=u:r:tee:s0 tcontext=u:object_r:vendor_gpt_block_device:s0 tclass=blk_file permissive=0
+[    4.427747] type=1400 audit(8338473.235:19): avc:  denied  { read write } for  comm="qseecomd" name="0:0:0:5" dev="tmpfs" ino=1189 scontext=u:r:tee:s0 tcontext=u:object_r:device:s0 tclass=chr_file permissive=0
+[    4.427764] type=1400 audit(8338473.235:20): avc:  denied  { read } for  comm="qseecomd" name="sdf" dev="tmpfs" ino=1235 scontext=u:r:tee:s0 tcontext=u:object_r:boot_block_device:s0 tclass=blk_file permissive=0
+[    4.436068] init: Command 'write /dev/cpuctl/foreground/cpu.uclamp.sched_boost_no_override 1' action=post-fs (/vendor/etc/init/hw/init.qti.kernel.rc:73) took 0ms and failed: Unable to write to file '/dev/cpuctl/foreground/cpu.uclamp.sched_boost_no_override': open() failed: Permission denied
+[    4.437473] init: Command 'write /dev/cpuctl/top-app/cpu.uclamp.sched_boost_no_override 1' action=post-fs (/vendor/etc/init/hw/init.qti.kernel.rc:74) took 1ms and failed: Unable to write to file '/dev/cpuctl/top-app/cpu.uclamp.sched_boost_no_override': open() failed: Permission denied
+[    4.438769] init: Command 'write /dev/cpuctl/background/cpu.uclamp.colocate 0' action=post-fs (/vendor/etc/init/hw/init.qti.kernel.rc:75) took 0ms and failed: Unable to write to file '/dev/cpuctl/background/cpu.uclamp.colocate': open() failed: Permission denied
+[    4.439262] init: Command 'write /dev/cpuctl/foreground/cpu.uclamp.colocate 0' action=post-fs (/vendor/etc/init/hw/init.qti.kernel.rc:76) took 0ms and failed: Unable to write to file '/dev/cpuctl/foreground/cpu.uclamp.colocate': open() failed: Permission denied
+[    4.439703] init: Command 'write /dev/cpuctl/top-app/cpu.uclamp.colocate 1' action=post-fs (/vendor/etc/init/hw/init.qti.kernel.rc:77) took 0ms and failed: Unable to write to file '/dev/cpuctl/top-app/cpu.uclamp.colocate': open() failed: Permission denied
+[    5.791688] type=1400 audit(8338474.599:21): avc:  denied  { write } for  comm="sh" name="read_ahead_kb" dev="sysfs" ino=64794 scontext=u:r:vendor_qti_init_shell:s0 tcontext=u:object_r:sysfs:s0 tclass=file permissive=0
+[    7.534450] init: Command 'write /dev/sys/block/by-name/rootdisk/queue/discard_max_bytes 134217728' action=boot (/system/etc/init/hw/init.rc:1206) took 0ms and failed: Unable to write to file '/dev/sys/block/by-name/rootdisk/queue/discard_max_bytes': open() failed: Permission denied
+[    7.537371] type=1400 audit(8338474.935:22): avc:  denied  { write } for  comm="init" name="discard_max_bytes" dev="sysfs" ino=57134 scontext=u:r:init:s0 tcontext=u:object_r:sysfs:s0 tclass=file permissive=0
+[    7.796915] type=1400 audit(8338475.199:23): avc:  denied  { read } for  comm="vendor.qti.hard" name="display" dev="sysfs" ino=45673 scontext=u:r:vendor_hal_perf_default:s0 tcontext=u:object_r:vendor_sys_nonsp_comp:s0 tclass=file permissive=0
+[    7.797161] type=1400 audit(8338475.199:24): avc:  denied  { read } for  comm="vendor.qti.hard" name="gpu" dev="sysfs" ino=45668 scontext=u:r:vendor_hal_perf_default:s0 tcontext=u:object_r:vendor_sys_sp_comp:s0 tclass=file permissive=0
+[    8.011833] type=1400 audit(8338475.415:25): avc:  denied  { read } for  comm="vendor.qti.medi" name="u:object_r:custom_version_prop:s0" dev="tmpfs" ino=199 scontext=u:r:mediacodec:s0 tcontext=u:object_r:custom_version_prop:s0 tclass=file permissive=0
+[    8.082248] init: Command 'write /sys/devices/platform/soc/${ro.boot.bootdevice}/clkscale_enable 0' action=boot (/vendor/etc/init/hw/init.qti.kernel.rc:93) took 0ms and failed: Unable to write to file '/sys/devices/platform/soc/4804000.ufshc/clkscale_enable': open() failed: Permission denied
+[    8.180888] type=1400 audit(8338475.583:26): avc:  denied  { read } for  comm="vendor.qti.hard" name="u:object_r:system_prop:s0" dev="tmpfs" ino=409 scontext=u:r:hal_graphics_composer_default:s0 tcontext=u:object_r:system_prop:s0 tclass=file permissive=0
+[    8.276189] type=1400 audit(8338475.679:27): avc:  denied  { read write } for  comm="binder:1480_2" name="disp_feature" dev="tmpfs" ino=1900 scontext=u:r:vendor_hal_displayfeature_xiaomi_default:s0 tcontext=u:object_r:device:s0 tclass=chr_file permissive=0
+[    8.313178] type=1400 audit(8338475.715:28): avc:  denied  { read write } for  comm="binder:1480_2" name="disp_feature" dev="tmpfs" ino=1900 scontext=u:r:vendor_hal_displayfeature_xiaomi_default:s0 tcontext=u:object_r:device:s0 tclass=chr_file permissive=0
+[    8.316670] type=1400 audit(8338475.719:29): avc:  denied  { read } for  comm="binder:1480_2" name="disp_feature" dev="tmpfs" ino=1900 scontext=u:r:vendor_hal_displayfeature_xiaomi_default:s0 tcontext=u:object_r:device:s0 tclass=chr_file permissive=0
+[    8.319963] type=1400 audit(8338475.723:30): avc:  denied  { read } for  comm="binder:1480_2" name="disp_feature" dev="tmpfs" ino=1900 scontext=u:r:vendor_hal_displayfeature_xiaomi_default:s0 tcontext=u:object_r:device:s0 tclass=chr_file permissive=0
+[   11.203110] type=1400 audit(8338478.607:31): avc:  denied  { write } for  comm="binder:1457_2" name="rear_qvga" dev="sysfs" ino=97730 scontext=u:r:hal_camera_default:s0 tcontext=u:object_r:sysfs:s0 tclass=file permissive=0
+[   12.290547] type=1400 audit(8338479.691:32): avc:  denied  { write } for  comm="mkdir" name="stp-policy" dev="configfs" ino=24497 scontext=u:r:vendor_qti_init_shell:s0 tcontext=u:object_r:configfs:s0 tclass=dir permissive=0
+[   12.370990] type=1400 audit(8338479.775:33): avc:  denied  { write } for  comm="init.qcom.sh" name="traceid" dev="sysfs" ino=85004 scontext=u:r:vendor_qti_init_shell:s0 tcontext=u:object_r:vendor_sysfs_qdss_dev:s0 tclass=file permissive=0
+[   12.975823] type=1400 audit(8338480.379:34): avc:  denied  { read } for  comm="main" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   12.980529] type=1400 audit(8338480.383:35): avc:  denied  { read } for  comm="main" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   13.027141] type=1107 audit(8338480.431:36): uid=0 auid=4294967295 ses=4294967295 subj=u:r:init:s0 msg='avc:  denied  { set } for property=ro.vendor.oem.wifimac pid=1735 uid=1001 gid=1001 scontext=u:r:rild:s0 tcontext=u:object_r:vendor_default_prop:s0 tclass=property_service permissive=0'
+[   13.030405] type=1107 audit(8338480.431:37): uid=0 auid=4294967295 ses=4294967295 subj=u:r:init:s0 msg='avc:  denied  { set } for property=ro.vendor.oem.btmac pid=1735 uid=1001 gid=1001 scontext=u:r:rild:s0 tcontext=u:object_r:vendor_default_prop:s0 tclass=property_service permissive=0'
+[   13.035362] type=1400 audit(8338480.435:38): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   13.035520] type=1400 audit(8338480.435:39): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   13.035615] type=1400 audit(8338480.439:40): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   13.035696] type=1400 audit(8338480.439:41): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   13.341213] type=1400 audit(8338480.743:42): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   13.341364] type=1400 audit(8338480.743:43): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   13.341470] type=1400 audit(8338480.743:44): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   13.341549] type=1400 audit(8338480.743:45): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   15.053875] type=1400 audit(8338482.455:46): avc:  denied  { read } for  comm="UimModule-Loope" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   15.054059] type=1400 audit(8338482.455:47): avc:  denied  { read } for  comm="UimModule-Loope" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   15.054180] type=1400 audit(8338482.455:48): avc:  denied  { read } for  comm="UimModule-Loope" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   16.259517] type=1400 audit(8338483.663:49): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   16.259659] type=1400 audit(8338483.663:50): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   16.259753] type=1400 audit(8338483.663:51): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   17.771047] type=1400 audit(8338485.175:52): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   17.771152] type=1400 audit(8338485.175:53): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   17.771188] type=1400 audit(8338485.175:54): avc:  denied  { read } for  comm="DispatcherModul" name="u:object_r:default_prop:s0" dev="tmpfs" ino=209 scontext=u:r:rild:s0 tcontext=u:object_r:default_prop:s0 tclass=file permissive=0
+[   21.974240] type=1400 audit(8338489.375:55): avc:  denied  { read } for  comm="HwBinder:1473_2" name="u:object_r:custom_version_prop:s0" dev="tmpfs" ino=199 scontext=u:r:mediacodec:s0 tcontext=u:object_r:custom_version_prop:s0 tclass=file permissive=0
+[   22.169839] type=1400 audit(8338489.571:56): avc:  denied  { read } for  comm="vendor.qti.medi" name="u:object_r:custom_version_prop:s0" dev="tmpfs" ino=199 scontext=u:r:mediacodec:s0 tcontext=u:object_r:custom_version_prop:s0 tclass=file permissive=0
+[   22.255186] type=1400 audit(8338489.659:57): avc:  denied  { read } for  comm="HwBinder:2920_2" name="u:object_r:custom_version_prop:s0" dev="tmpfs" ino=199 scontext=u:r:mediacodec:s0 tcontext=u:object_r:custom_version_prop:s0 tclass=file permissive=0
+[   27.310683] type=1400 audit(8338494.711:58): avc:  denied  { read } for  comm="HwBinder:2977_2" name="u:object_r:custom_version_prop:s0" dev="tmpfs" ino=199 scontext=u:r:mediacodec:s0 tcontext=u:object_r:custom_version_prop:s0 tclass=file permissive=0
 
 C:\Users\delac>
