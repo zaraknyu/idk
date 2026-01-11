@@ -1,3 +1,17 @@
+zarakinyu@DESKTOP-E35KJB8:~/android_device_xiaomi_warm$ git grep -i DEVICE_PATH
+BoardConfig.mk:DEVICE_PATH := device/xiaomi/warm
+BoardConfig.mk:KERNEL_PATH := $(DEVICE_PATH)-kernel
+BoardConfig.mk:BOARD_BLUETOOTH_BDROID_BUILDCFG_INCLUDE_DIR := $(DEVICE_PATH)/bluetooth/include
+BoardConfig.mk:TARGET_FS_CONFIG_GEN := $(DEVICE_PATH)/configs/config.fs
+BoardConfig.mk:    $(DEVICE_PATH)/hidl/compatibility_matrix.device.xml \
+BoardConfig.mk:DEVICE_FRAMEWORK_MANIFEST_FILE := $(DEVICE_PATH)/hidl/framework_manifest.xml
+BoardConfig.mk:DEVICE_MATRIX_FILE := $(DEVICE_PATH)/hidl/compatibility_matrix.xml
+BoardConfig.mk:    $(DEVICE_PATH)/hidl/manifest_vendor.xml \
+BoardConfig.mk:TARGET_ODM_PROP += $(DEVICE_PATH)/props/odm.prop
+BoardConfig.mk:TARGET_PRODUCT_PROP += $(DEVICE_PATH)/props/product.prop
+BoardConfig.mk:TARGET_SYSTEM_PROP += $(DEVICE_PATH)/props/system.prop
+BoardConfig.mk:TARGET_VENDOR_PROP += $(DEVICE_PATH)/props/vendor.prop
+BoardConfig.mk:TARGET_RECOVERY_FSTAB := $(DEVICE_PATH)/rootdir/etc/fstab.default
 zarakinyu@DESKTOP-E35KJB8:~/android_device_xiaomi_warm$ git grep -i warm
 AndroidProducts.mk:    $(LOCAL_DIR)/lineage_warm.mk
 BoardConfig.mk:DEVICE_PATH := device/xiaomi/warm
@@ -73,22 +87,19 @@ overlay/WifiOverlayWarm/Android.bp:    name: "WifiOverlayWarmRedmi",
 overlay/WifiOverlayWarm/AndroidManifest-POCO.xml:    package="com.android.wifi.resources.overlay.warm.poco">
 overlay/WifiOverlayWarm/AndroidManifest-Redmi.xml:    package="com.android.wifi.resources.overlay.warm.redmi">
 overlay/WifiOverlayWarm/AndroidManifest.xml:    package="com.android.wifi.resources.overlay.warm">
+proprietary-files.txt:# All unpinned blobs below are extracted from warm OS2.0.203.0.VGVINXM - warm_in_global-ota_full-OS2.0.203.0.VGVINXM
+proprietary-files.txt:vendor/etc/vintf/manifest/vendor.qti.hardware.display.composer-service.xml:vendor/etc/vintf/manifest/vendor.qti.hardware.display.composer-service_warm.xml
+proprietary-files.txt:vendor/etc/sensors/config/warm_mir3da_0.json
+proprietary-files.txt:vendor/etc/sensors/config/warm_och191x_0.json
+proprietary-files.txt:vendor/etc/sensors/config/warm_qmc630x_0.json
+proprietary-files.txt:vendor/etc/sensors/config/warm_sc7a20_0.json
+proprietary-files.txt:vendor/etc/sensors/config/warm_stk3a8x_0.json
+proprietary-files.txt:vendor/etc/sensors/config/warm_stk83xx_0.json
 props/odm.prop:ro.product.odm.name=warm_global
 props/system.prop:ro.product.mod_device=warm_global
 rootdir/Android.bp:    name: "init.warm.rc",
 rootdir/Android.bp:    src: "etc/init.warm.rc",
-zarakinyu@DESKTOP-E35KJB8:~/android_device_xiaomi_warm$ git grep -i DEVICE_PATH
-BoardConfig.mk:DEVICE_PATH := device/xiaomi/warm
-BoardConfig.mk:KERNEL_PATH := $(DEVICE_PATH)-kernel
-BoardConfig.mk:BOARD_BLUETOOTH_BDROID_BUILDCFG_INCLUDE_DIR := $(DEVICE_PATH)/bluetooth/include
-BoardConfig.mk:TARGET_FS_CONFIG_GEN := $(DEVICE_PATH)/configs/config.fs
-BoardConfig.mk:    $(DEVICE_PATH)/hidl/compatibility_matrix.device.xml \
-BoardConfig.mk:DEVICE_FRAMEWORK_MANIFEST_FILE := $(DEVICE_PATH)/hidl/framework_manifest.xml
-BoardConfig.mk:DEVICE_MATRIX_FILE := $(DEVICE_PATH)/hidl/compatibility_matrix.xml
-BoardConfig.mk:    $(DEVICE_PATH)/hidl/manifest_vendor.xml \
-BoardConfig.mk:TARGET_ODM_PROP += $(DEVICE_PATH)/props/odm.prop
-BoardConfig.mk:TARGET_PRODUCT_PROP += $(DEVICE_PATH)/props/product.prop
-BoardConfig.mk:TARGET_SYSTEM_PROP += $(DEVICE_PATH)/props/system.prop
-BoardConfig.mk:TARGET_VENDOR_PROP += $(DEVICE_PATH)/props/vendor.prop
-BoardConfig.mk:TARGET_RECOVERY_FSTAB := $(DEVICE_PATH)/rootdir/etc/fstab.default
-zarakinyu@DESKTOP-E35KJB8:~/android_device_xiaomi_warm$
+vendorsetup.sh:git clone https://github.com/POCO-warm/android_vendor_xiaomi_warm -b lineage-23.0 || fatal "Vendor tree clone failed!"
+vendorsetup.sh:git clone https://github.com/POCO-warm/android_device_xiaomi_warm-kernel -b lineage-23.0 device/xiaomi/warm-kernel || fatal "Prebuilt Kernel source clone failed!"
+vendorsetup.sh:git clone https://github.com/POCO-warm/android_hardware_qcom-caf_common -b lineage-23.0 hardware/qcom-caf/common || fatal "Qcom Caf Tree clone failed!"
+(END)
