@@ -1,111 +1,45 @@
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 80 *************************Metadata*************************
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 81 GKV size:4
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 84 key:0xa1000000, value:0xa100000e 
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: metadata_print:    key[StreamRX] value[PCM_LL_Playback]
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 84 key:0xab000000, value:0x1 
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: metadata_print:    key[Instance] value[Instance_1]
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 84 key:0xa2000000, value:0xa2000001 
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: metadata_print:    key[DeviceRX] value[Speaker]
-01-13 00:30:20.338  3856  3856 I adsp_sleepmon: Audio: num_sessions=1,num_lpi_sessions=0,timer_pending=0
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 84 key:0xac000000, value:0xac000002 
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: metadata_print:    key[DevicePP_Rx] value[Audio_MBDRC]
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 89 
-01-13 00:30:20.332  1401  3856 D AGM: metadata: CKV count:3
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 92 key:0xa4000000, value:0xf 
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: metadata_print:    key[Volume] value[Level_15]
-01-13 00:30:20.342  3856  3856 I adsp_sleepmon: Audio: num_sessions=0,num_lpi_sessions=0,timer_pending=1
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 92 key:0xd2000000, value:0x0 
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: metadata_print:    key[Gain] value[Gain_0]
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 92 key:0xf200000, value:0x1 
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: metadata_print:    key[Fsm_Spk_Mode] value[Music_Mode]
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 95 
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 97 Property ID:134217744 (0x00000010)
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 98 property count:4
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 101 Property Values: 
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 103 0x1 
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 103 0x3 
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 103 0x2 
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 103 0x5 
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 105 
-01-13 00:30:20.332  1401  3856 D AGM: metadata: metadata_print: 106 ****************Metadata Done***************************
-01-13 00:30:20.332  1401  3856 D AGM: metadata: 
-01-13 00:30:20.332  1401  3856 E ACDB    : vendor/qcom/proprietary/args/acdb/src/acdb_command.c:AcdbCmdGetGraphAlias:3938 Error[19]: Unable to find graph key vector. No matching key value pairs were found
-01-13 00:30:20.332  1401  3856 E gsl     : vendor/qcom/proprietary/args/gsl/src/gsl_main.c:gsl_get_graph_alias:2253 acdb get graph alias failed 19, len 255
-01-13 00:30:20.332  1401  3856 D AGM: graph: print_graph_alias: 2334 gsl_get_graph_alias failed: ret = 19
-01-13 00:30:20.332  1401  3856 D AGM: graph: graph_open: 630 miid 40bd mid 7001000 tag c0000002
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: graph_open:                        tag stream_input_media_format
-01-13 00:30:20.332  1401  3856 D AGM: graph: graph_open: 679 miid 4023 mid 7001023 tag c0000004
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: graph_open:                        tag device_hw_ep_rx
-01-13 00:30:20.332  1401  3856 D AGM: graph: graph_open: 630 miid 40c4 mid 7001019 tag c0000006
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: graph_open:                        tag stream_pause
-01-13 00:30:20.332  1401  3856 D AGM: graph: graph_open: 630 miid 40bf mid 7001005 tag c000000e
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: graph_open:                        tag stream_pcm_decoder
-01-13 00:30:20.332  1401  3856 D AGM: graph: graph_open: 630 miid 40c0 mid 7001003 tag c0000010
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: graph_open:                        tag stream_pcm_converter
-01-13 00:30:20.332  1401  3856 D AGM: graph: graph_open: 630 miid 4165 mid 7001032 tag c0000013
-01-13 00:30:20.332  1401  3856 D kv_xml_parser: graph_open:                        tag stream_spr
-01-13 00:30:20.332  1401  3856 I GPR:    : vendor/qcom/proprietary/args/gpr/core/src/gpr_drv.c:__gpr_cmd_register_v2:931 GPR Register: Source Port is 8209 heap_index: 0
-01-13 00:30:20.332  1401  3856 I gsl     : vendor/qcom/proprietary/args/gsl/src/gsl_common.c:gsl_send_spf_cmd:174 sending pkt with token 0x167b000, opcode 0x1001000
-01-13 00:30:20.333  1401  3856 I gsl     : vendor/qcom/proprietary/args/gsl/src/gsl_common.c:gsl_send_spf_cmd:202 rcvd pkt token : 0x167b000
-01-13 00:30:20.333  1401  3856 E AR Error Detection Logger: vendor/qcom/proprietary/args/ar_util/src/ar_util_err_detection.c:ar_err_det_detect_spf_error:241 Too many EDuplicate. GSL/SPF desync or bad graph. Restarting
-01-13 00:30:20.333  1401  3856 I AR Error Detection Logger: vendor/qcom/proprietary/args/ar_util/src/ar_util_err_detection.c:ar_err_det_detect_spf_error:253 Last DUPLICATE restart too recent. Silencing detected error
-01-13 00:30:20.333  1401  3856 E gsl     : vendor/qcom/proprietary/args/gsl/src/gsl_graph.c:gsl_graph_open_sgids_and_connections:2865 Graph open failed:24
-01-13 00:30:20.333  1401  3856 E gsl     : vendor/qcom/proprietary/args/gsl/src/gsl_graph.c:gsl_graph_open:4279 graph open for single gkv failed 24
-01-13 00:30:20.333  1401  3856 E COMU    : vendor/qcom/proprietary/args/ar_osal/src/linux/ar_osal_mutex.c:ar_osal_mutex_lock:111 ar_osal_mutex_lock: ar_osal_mutex is NULL
-01-13 00:30:20.333  1401  3856 E COMU    : vendor/qcom/proprietary/args/ar_osal/src/linux/ar_osal_mutex.c:ar_osal_mutex_unlock:149 ar_osal_mutex_unlock: ar_osal_mutex is NULL
-01-13 00:30:20.333  1401  3856 E COMU    : vendor/qcom/proprietary/args/ar_osal/src/linux/ar_osal_mutex.c:ar_osal_mutex_lock:111 ar_osal_mutex_lock: ar_osal_mutex is NULL
-01-13 00:30:20.333  1401  3856 E COMU    : vendor/qcom/proprietary/args/ar_osal/src/linux/ar_osal_mutex.c:ar_osal_mutex_unlock:149 ar_osal_mutex_unlock: ar_osal_mutex is NULL
-01-13 00:30:20.333  1401  3856 E AGM: graph: graph_open: 699 Failed to open the graph with error -68
-01-13 00:30:20.333  1401  3856 D AGM: graph: graph_open: 748 exit, ret -68
-01-13 00:30:20.334  1401  3856 E AGM: session: session_connect_aif: 772 Error:-68 graph open failed session_id: 126,                           audio interface id:1 
-01-13 00:30:20.334  1401  3856 E AGM: session: session_open_with_first_device: 897 Audio interface(Backend):1 <-> session(Frontend):126                    Connect failed error:-68
-01-13 00:30:20.334  1401  3856 E AGM: session: session_obj_open: 2175 Unable to open a session with Session ID:126
-01-13 00:30:20.334  1401  3856 D agm_client_wrapper: agm_session_open Received handle = 0x70fcc9ba80 , *handle = 0
-01-13 00:30:20.334  1401  3856 E PAL: SessionAlsaPcm: start: 1113: pcm open not ready
-01-13 00:30:20.334  1401  3856 D PAL: Stream: getStreamType: 440: streamType - 1
-01-13 00:30:20.335  1401  3856 I PAL: ResourceManager: voteSleepMonitor: 2195: Unvoting done for nlpi use case, lpi votes 0, nlpi votes : 0
-01-13 00:30:20.335  1401  3856 D PAL: SessionAlsaPcm: start: 1964: Exit status: -68
-01-13 00:30:20.335  1401  3856 E PAL: StreamPCM: start: 508: Rx session start is failed with status -68
-01-13 00:30:20.335  1401  3856 D PAL: Device: stop_l: 711: Enter. deviceCount 1 deviceStartStopCount 1 for device id 3 (PAL_DEVICE_OUT_SPEAKER)
-01-13 00:30:20.335  1401  3856 D PAL: memLoggerBuilder: palStateQueueBuilder: 14: Entered PAL State Queue Builder
-01-13 00:30:20.335  1401  3856 E PAL: memLoggerBuilder: palStateQueueBuilder: 23: queues failed to initialize
-01-13 00:30:20.335  1401  3856 E COMU    : vendor/qcom/proprietary/args/ar_osal/src/linux/ar_osal_mutex.c:ar_osal_mutex_lock:111 ar_osal_mutex_lock: ar_osal_mutex is NULL
-01-13 00:30:20.335  1401  3856 E COMU    : vendor/qcom/proprietary/args/ar_osal/src/linux/ar_osal_mutex.c:ar_osal_mutex_unlock:149 ar_osal_mutex_unlock: ar_osal_mutex is NULL
-01-13 00:30:20.335  1401  3856 D PAL: StreamPCM: start: 682: Exit. state 1, status -68
-01-13 00:30:20.335  1401  3856 D PAL: ResourceManager: decreaseStreamUserCounter: 4004: stream 0xb4000072eeddab10 counter was 1
-01-13 00:30:20.335  1401  3856 D PAL: ResourceManager: decreaseStreamUserCounter: 4012: stream 0xb4000072eeddab10 not in use
-01-13 00:30:20.335  1401  3856 D PAL: ResourceManager: decreaseStreamUserCounter: 4015: stream 0xb4000072eeddab10 counter decreased to 0
-01-13 00:30:20.335  1401  3856 E PAL: API: pal_stream_start: 392: stream start failed. status -68
-01-13 00:30:20.335  1401  3856 I PAL: API: pal_stream_start: 397: Exit. status -68
-01-13 00:30:20.335  1401  3856 E COMU    : vendor/qcom/proprietary/args/ar_osal/src/linux/ar_osal_mutex.c:ar_osal_mutex_lock:111 ar_osal_mutex_lock: ar_osal_mutex is NULL
-01-13 00:30:20.335  1401  3856 E COMU    : vendor/qcom/proprietary/args/ar_osal/src/linux/ar_osal_mutex.c:ar_osal_mutex_unlock:149 ar_osal_mutex_unlock: ar_osal_mutex is NULL
-01-13 00:30:20.335  1401  3856 E AHAL: AudioStream: configurePalOutputStream: 3696: failed to start stream. ret=-68
-01-13 00:30:20.335  1401  3856 I PAL: API: pal_stream_close: 294: Enter. Stream handle :0xb4000072eeddab10K
-01-13 00:30:20.335  1401  3856 E COMU    : vendor/qcom/proprietary/args/ar_osal/src/linux/ar_osal_mutex.c:ar_osal_mutex_lock:111 ar_osal_mutex_lock: ar_osal_mutex is NULL
-01-13 00:30:20.335  1401  3856 E COMU    : vendor/qcom/proprietary/args/ar_osal/src/linux/ar_osal_mutex.c:ar_osal_mutex_unlock:149 ar_osal_mutex_unlock: ar_osal_mutex is NULL
-01-13 00:30:20.335  1401  3856 D PAL: Stream: setCachedState: 2224: set cachedState to 0
-01-13 00:30:20.335  1401  3856 D PAL: StreamPCM: close: 317: Enter. session handle - 0xb4000072dedd63b0K device count - 1 state 1
-01-13 00:30:20.335  1401  3856 D PAL: SessionAlsaPcm: close: 2155: Enter
-01-13 00:30:20.335  1401  3856 D PAL: Stream: getAssociatedDevices: 550: no. of devices 1
-01-13 00:30:20.335  1401  3856 D PAL: SessionAlsaPcm: close: 2215: backendname CODEC_DMA-LPAIF_RXTX-RX-1
-01-13 00:30:20.335  1401  3856 D PAL: SessionAlsaPcm: close: 2224: Rx dev not active
-01-13 00:30:20.335  1401  3856 D PAL: ResourceManager: getVirtualAudioMixer: 4716: ar 0x70fcc9c078K audio_virt_mixer 0xb4000072eedcf890K
-01-13 00:30:20.335  1401  3856 D PAL: SessionAlsaUtils: getFeMixerControl: 346: mixer control PCM126 control
-01-13 00:30:20.335  1401  3856 D PAL: SessionAlsaUtils: getFeMixerControl: 346: mixer control PCM126 metadata
-01-13 00:30:20.335  1401  3856 D PAL: SessionAlsaUtils: getFeMixerControl: 346: mixer control PCM126 connect
-01-13 00:30:20.335  1401  3856 D PAL: SessionAlsaUtils: getFeMixerControl: 346: mixer control PCM126 disconnect
-01-13 00:30:20.335  1401  3856 D PAL: SessionAlsaUtils: getBeMixerControl: 360: mixer control CODEC_DMA-LPAIF_RXTX-RX-1 metadata
-01-13 00:30:20.335  1401  3856 I AGM: API: agm_session_aif_connect: 625 disconnecting aifid:1 with session id=126
-01-13 00:30:20.335  1401  3856 D PAL: SessionAlsaUtils: close: 720: backend CODEC_DMA-LPAIF_RXTX-RX-1 and freedevicemetadata 1
-01-13 00:30:20.335  1401  3856 I AGM: device: device_set_metadata: 708 Setting device metadata for CODEC_DMA-LPAIF_RXTX-RX-1
-01-13 00:30:20.335  1401  3856 D AGM: metadata: metadata_print: 80 *************************Metadata*************************
-01-13 00:30:20.336  1401  3856 D AGM: metadata: metadata_print: 81 GKV size:0
-01-13 00:30:20.336  1401  3856 D AGM: metadata: metadata_print: 89 
-01-13 00:30:20.336  1401  3856 D AGM: metadata: CKV count:0
-01-13 00:30:20.336  1401  3856 D AGM: metadata: metadata_print: 95 
-01-13 00:30:20.336  1401  3856 D AGM: metadata: metadata_print: 97 Property ID:134217744 (0x00000010)
-01-13 00:30:20.336  1401  3856 D AGM: metadata: metadata_print: 98 property count:2
-01-13 00:30:20.336  1401  3856 D AGM: metadata: metadata_print: 101 Property Values: 
-01-13 00:30:20.336  1401  3856 D AGM: metadata: metadata_print: 103 0x2 
-01-13 00:30:20.336  1401  3856 D AGM: metadata: metadata_print: 103 0x5 
-01-13 00:30:20.336  1401  3856 D AGM: metadata: metadata_print: 105 
+# Media (KEEP)
+vendor/bin/hw/vendor.qti.media.c2@1.0-service
+vendor/bin/hw/vendor.qti.media.c2audio@1.0-service
+vendor/etc/init/init.qti.media.rc
+vendor/etc/init/vendor.qti.media.c2@1.0-service.rc
+vendor/etc/init/vendor.qti.media.c2audio@1.0-service.rc
+vendor/etc/seccomp_policy/c2audio.vendor.base-arm.policy
+vendor/etc/seccomp_policy/c2audio.vendor.base-arm64.policy
+vendor/etc/seccomp_policy/c2audio.vendor.ext-arm.policy
+vendor/etc/seccomp_policy/c2audio.vendor.ext-arm64.policy
+vendor/etc/seccomp_policy/codec2.vendor.base-arm64.policy
+vendor/etc/seccomp_policy/codec2.vendor.ext-arm64.policy
+vendor/etc/vintf/manifest/c2_manifest_vendor.xml
+vendor/etc/vintf/manifest/c2_manifest_vendor_audio.xml
+vendor/lib64/libAlacSwDec.so
+vendor/lib64/libApeSwDec.so
+vendor/lib64/libEvrcSwCodec.so
+vendor/lib64/libFlacSwDec.so
+vendor/lib64/libQcelp13SwCodec.so
+vendor/lib64/libdsd2pcm.so
+vendor/lib64/libqc2audio_base.so
+vendor/lib64/libqc2audio_basecodec.so
+vendor/lib64/libqc2audio_core.so
+vendor/lib64/libqc2audio_hooks.so
+vendor/lib64/libqc2audio_hwaudiocodec.so
+vendor/lib64/libqc2audio_platform.so
+vendor/lib64/libqc2audio_swaudiocodec.so
+vendor/lib64/libqc2audio_utils.so
+vendor/lib64/libqc2vppfilter.so
+vendor/lib64/libqcodec2_base.so
+vendor/lib64/libqcodec2_basecodec.so
+vendor/lib64/libqcodec2_core.so
+vendor/lib64/libqcodec2_cvpfilter.so
+vendor/lib64/libqcodec2_filterbase.so
+vendor/lib64/libqcodec2_hooks.so
+vendor/lib64/libqcodec2_imgtxrfilter.so
+vendor/lib64/libqcodec2_mockfilter.so
+vendor/lib64/libqcodec2_mocklutfilter.so
+vendor/lib64/libqcodec2_platform.so
+vendor/lib64/libqcodec2_srfilter.so
+vendor/lib64/libqcodec2_streaminteg_filter.so
+vendor/lib64/libqcodec2_utils.so
+vendor/lib64/libqcodec2_v4l2codec.so
+vendor/lib64/libvideotxr.so
+vendor/lib64/qti.video.utils.videobufferlayout.so
